@@ -17,13 +17,17 @@ Automatic crash, screen, network, retry, and offline-queue instrumentation shoul
 
 ## Install
 
-The package is not published yet. Once it is published, the intended Gradle dependency is:
+Install the Android SDK from Maven Central:
 
 ```kotlin
 dependencies {
     implementation("org.logister:logister-android:0.1.0")
 }
 ```
+
+- Maven Central: https://central.sonatype.com/artifact/org.logister/logister-android
+- Maven repository path: https://repo1.maven.org/maven2/org/logister/logister-android/
+- Android integration docs: https://docs.logister.org/integrations/android/
 
 For local development, open this repository as an Android library project or include it as a composite build from an Android app.
 
@@ -35,9 +39,8 @@ The Maven coordinates are:
 org.logister:logister-android:<version>
 ```
 
-Before the first release, verify the `org.logister` namespace in Sonatype
-Central Portal and make sure the release signing public key has been published
-to a public keyserver.
+The `org.logister` namespace is verified in Sonatype Central Portal. Release
+signing uses an in-memory GPG key from GitHub Actions secrets.
 
 The release workflow uses GitHub Actions secrets, not checked-in credentials:
 
@@ -55,7 +58,7 @@ git push origin v0.1.0
 
 After the workflow succeeds, review the deployment in Sonatype Central Portal
 and click **Publish**. The workflow intentionally uploads without automatically
-publishing so the first releases can be inspected before sync to Maven Central.
+publishing so signed artifacts can be inspected before sync to Maven Central.
 
 ## Kotlin Usage
 
