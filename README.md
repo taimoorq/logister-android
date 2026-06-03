@@ -7,7 +7,7 @@ This repository is the canonical home for the Android package add-on. Build Andr
 ## Current Scope
 
 - Single-module Android library configured for Gradle and Maven publication.
-- Kotlin-first helpers backed by a small Java core for broad Android and Java interop.
+- Kotlin core with Java-compatible builders and async APIs for broad Android interop.
 - Dependency-light HTTP transport using `HttpURLConnection`.
 - Injectable transport for tests or alternate networking stacks.
 - Async client methods for errors, logs, metrics, transactions, spans, and check-ins.
@@ -124,8 +124,9 @@ client.checkInAsync("daily-sync", "ok") {
 
 ## Java Interop
 
-The underlying client classes remain Java-friendly, so Java apps can still use
-`LogisterClient.builder(...)` and `LogisterEventOptions.builder(...)` directly.
+The Kotlin client classes remain Java-friendly, so Java apps can still use
+`LogisterClient.builder(...)`, `LogisterEventOptions.builder(...)`, and
+`LogisterSpan.builder(...)` directly.
 
 ## Verification
 

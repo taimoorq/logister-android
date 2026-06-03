@@ -1,0 +1,336 @@
+package org.logister.android
+
+import android.os.Build
+import java.util.LinkedHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import org.json.JSONObject
+
+/** Main Android client for sending telemetry to Logister. */
+public class LogisterClient private constructor(
+    private val apiKey: String,
+    private val endpoint: String,
+    private val environment: String?,
+    private val release: String?,
+    private val service: String?,
+    private val packageName: String?,
+    private val appVersion: String?,
+    private val buildNumber: String?,
+    private val buildType: String?,
+    private val defaultContext: Map<String, Any>,
+    private val includeDeviceContext: Boolean,
+    private val connectTimeoutMs: Int,
+    private val readTimeoutMs: Int,
+    private val transport: LogisterTransport,
+    private val executor: ExecutorService
+) {
+    public fun captureAsync(event: LogisterEvent): Future<LogisterResponse> =
+        captureAsync(event, LogisterEventOptions.EMPTY)
+
+    public fun captureAsync(
+        event: LogisterEvent,
+        options: LogisterEventOptions?
+    ): Future<LogisterResponse> =
+        executor.submit<LogisterResponse> { capture(event, options) }
+
+    @Throws(Exception::class)
+    public fun capture(event: LogisterEvent): LogisterResponse =
+        capture(event, LogisterEventOptions.EMPTY)
+
+    @Throws(Exception::class)
+    public fun capture(event: LogisterEvent, options: LogisterEventOptions?): LogisterResponse {
+        val envelope = JSONObject()
+        envelope.put("event", buildEventPayload(event, options ?: LogisterEventOptions.EMPTY))
+        return transport.send(endpoint, apiKey, envelope, connectTimeoutMs, readTimeoutMs)
+    }
+
+    public fun captureExceptionAsync(throwable: Throwable): Future<LogisterResponse> =
+        captureExceptionAsync(throwable, LogisterEventOptions.EMPTY)
+
+    public fun captureExceptionAsync(
+        throwable: Throwable,
+        options: LogisterEventOptions?
+    ): Future<LogisterResponse> =
+        captureAsync(exceptionEvent(throwable), options)
+
+    public fun captureMessageAsync(message: String): Future<LogisterResponse> =
+        captureMessageAsync(message, LogisterEventOptions.EMPTY)
+
+    public fun captureMessageAsync(
+        message: String,
+        options: LogisterEventOptions?
+    ): Future<LogisterResponse> {
+        val level = options?.level ?: "info"
+        return captureAsync(LogisterEvent.builder("log", message).level(level).build(), options)
+    }
+
+    public fun captureMetricAsync(name: String, value: Double): Future<LogisterResponse> =
+        captureMetricAsync(name, value, null, LogisterEventOptions.EMPTY)
+
+    public fun captureMetricAsync(
+        name: String,
+        value: Double,
+        unit: String?
+    ): Future<LogisterResponse> =
+        captureMetricAsync(name, value, unit, LogisterEventOptions.EMPTY)
+
+    public fun captureMetricAsync(
+        name: String,
+        value: Double,
+        unit: String?,
+        options: LogisterEventOptions?
+    ): Future<LogisterResponse> {
+        val event = LogisterEvent.builder("metric", name)
+            .context("value", value)
+        if (unit != null) {
+            event.context("unit", unit)
+        }
+        return captureAsync(event.build(), options)
+    }
+
+    public fun captureTransactionAsync(name: String, durationMs: Double): Future<LogisterResponse> =
+        captureTransactionAsync(name, durationMs, LogisterEventOptions.EMPTY)
+
+    public fun captureTransactionAsync(
+        name: String,
+        durationMs: Double,
+        options: LogisterEventOptions?
+    ): Future<LogisterResponse> {
+        val event = LogisterEvent.builder("transaction", name)
+            .attribute("transaction_name", name)
+            .attribute("duration_ms", durationMs)
+            .build()
+        return captureAsync(event, options)
+    }
+
+    public fun captureSpanAsync(span: LogisterSpan): Future<LogisterResponse> =
+        captureSpanAsync(span, LogisterEventOptions.EMPTY)
+
+    public fun captureSpanAsync(
+        span: LogisterSpan,
+        options: LogisterEventOptions?
+    ): Future<LogisterResponse> =
+        captureAsync(span.toEvent(), options)
+
+    public fun checkInAsync(slug: String, status: String): Future<LogisterResponse> =
+        checkInAsync(slug, status, LogisterEventOptions.EMPTY)
+
+    public fun checkInAsync(
+        slug: String,
+        status: String,
+        options: LogisterEventOptions?
+    ): Future<LogisterResponse> {
+        val event = LogisterEvent.builder("check_in", slug)
+            .context("check_in_slug", slug)
+            .context("check_in_status", status)
+            .build()
+        return captureAsync(event, options)
+    }
+
+    @Throws(Exception::class)
+    private fun buildEventPayload(event: LogisterEvent, options: LogisterEventOptions): JSONObject {
+        val payload = event.toJson()
+        val context = baseContext()
+        context.putAll(event.context)
+        context.putAll(options.context)
+
+        LogisterEvent.putIfPresent(payload, "level", firstPresent(options.level, event.level))
+        LogisterEvent.putIfPresent(payload, "fingerprint", firstPresent(options.fingerprint, event.fingerprint))
+        LogisterEvent.putIfPresent(payload, "occurred_at", firstPresent(options.occurredAt, event.occurredAt))
+        LogisterEvent.putIfPresent(payload, "environment", firstPresent(options.environment, environment))
+        LogisterEvent.putIfPresent(payload, "release", firstPresent(options.release, release))
+        LogisterEvent.putIfPresent(payload, "trace_id", options.traceId)
+        LogisterEvent.putIfPresent(payload, "request_id", options.requestId)
+        LogisterEvent.putIfPresent(payload, "session_id", options.sessionId)
+        LogisterEvent.putIfPresent(payload, "user_id", options.userId)
+        LogisterEvent.putIfPresent(payload, "transaction_name", options.transactionName)
+        LogisterEvent.putIfPresent(payload, "duration_ms", options.durationMs)
+
+        putContext(context, "environment", firstPresent(options.environment, environment))
+        putContext(context, "release", firstPresent(options.release, release))
+        putContext(context, "trace_id", options.traceId)
+        putContext(context, "request_id", options.requestId)
+        putContext(context, "session_id", options.sessionId)
+        putContext(context, "user_id", options.userId)
+        putContext(context, "transaction_name", options.transactionName)
+        putContext(context, "duration_ms", options.durationMs)
+
+        payload.put("context", JSONObject(context))
+        return payload
+    }
+
+    private fun exceptionEvent(throwable: Throwable): LogisterEvent {
+        var message = throwable.javaClass.name
+        if (!throwable.message.isNullOrEmpty()) {
+            message += ": ${throwable.message}"
+        }
+
+        return try {
+            LogisterEvent.builder("error", message)
+                .level("error")
+                .context("exception", LogisterExceptionSerializer.serialize(throwable))
+                .build()
+        } catch (_: Exception) {
+            LogisterEvent.builder("error", message)
+                .level("error")
+                .context("exception_class", throwable.javaClass.name)
+                .build()
+        }
+    }
+
+    private fun baseContext(): MutableMap<String, Any> {
+        val context: MutableMap<String, Any> = LinkedHashMap()
+        context["platform"] = "android"
+        putContext(context, "service", firstPresent(service, packageName))
+        putContext(context, "package_name", packageName)
+        putContext(context, "app_version", appVersion)
+        putContext(context, "build_number", buildNumber)
+        putContext(context, "build_type", buildType)
+        context.putAll(defaultContext)
+
+        if (includeDeviceContext) {
+            putContext(context, "device_manufacturer", Build.MANUFACTURER)
+            putContext(context, "device_model", Build.MODEL)
+            putContext(context, "device_brand", Build.BRAND)
+            putContext(context, "os_name", "Android")
+            putContext(context, "os_version", Build.VERSION.RELEASE)
+            context["android_api_level"] = Build.VERSION.SDK_INT
+        }
+
+        return context
+    }
+
+    public class Builder internal constructor(
+        private val apiKey: String,
+        private val endpoint: String
+    ) {
+        private var environment: String? = null
+        private var release: String? = null
+        private var service: String? = null
+        private var packageName: String? = null
+        private var appVersion: String? = null
+        private var buildNumber: String? = null
+        private var buildType: String? = null
+        private val defaultContext: MutableMap<String, Any> = LinkedHashMap()
+        private var includeDeviceContext: Boolean = true
+        private var connectTimeoutMs: Int = 10_000
+        private var readTimeoutMs: Int = 10_000
+        private var transport: LogisterTransport = HttpUrlConnectionLogisterTransport()
+        private var executor: ExecutorService = Executors.newSingleThreadExecutor()
+
+        public fun environment(environment: String?): Builder = apply {
+            this.environment = environment
+        }
+
+        public fun release(release: String?): Builder = apply {
+            this.release = release
+        }
+
+        public fun service(service: String?): Builder = apply {
+            this.service = service
+        }
+
+        public fun packageName(packageName: String?): Builder = apply {
+            this.packageName = packageName
+        }
+
+        public fun appVersion(appVersion: String?): Builder = apply {
+            this.appVersion = appVersion
+        }
+
+        public fun buildNumber(buildNumber: String?): Builder = apply {
+            this.buildNumber = buildNumber
+        }
+
+        public fun buildType(buildType: String?): Builder = apply {
+            this.buildType = buildType
+        }
+
+        public fun defaultContext(key: String?, value: Any?): Builder = apply {
+            if (!key.isNullOrEmpty() && value != null) {
+                defaultContext[key] = value
+            }
+        }
+
+        public fun defaultContext(context: Map<String, *>?): Builder = apply {
+            context?.forEach { (key, value) ->
+                defaultContext(key, value)
+            }
+        }
+
+        public fun includeDeviceContext(includeDeviceContext: Boolean): Builder = apply {
+            this.includeDeviceContext = includeDeviceContext
+        }
+
+        public fun timeoutMs(connectTimeoutMs: Int, readTimeoutMs: Int): Builder = apply {
+            this.connectTimeoutMs = connectTimeoutMs
+            this.readTimeoutMs = readTimeoutMs
+        }
+
+        public fun transport(transport: LogisterTransport?): Builder = apply {
+            if (transport != null) {
+                this.transport = transport
+            }
+        }
+
+        public fun executor(executor: ExecutorService?): Builder = apply {
+            if (executor != null) {
+                this.executor = executor
+            }
+        }
+
+        public fun build(): LogisterClient =
+            LogisterClient(
+                apiKey = requireValue("apiKey", apiKey),
+                endpoint = requireValue("endpoint", endpoint),
+                environment = environment,
+                release = release,
+                service = service,
+                packageName = packageName,
+                appVersion = appVersion,
+                buildNumber = buildNumber,
+                buildType = buildType,
+                defaultContext = LinkedHashMap(defaultContext),
+                includeDeviceContext = includeDeviceContext,
+                connectTimeoutMs = connectTimeoutMs,
+                readTimeoutMs = readTimeoutMs,
+                transport = transport,
+                executor = executor
+            )
+    }
+
+    public companion object {
+        @JvmStatic
+        public fun builder(apiKey: String, baseUrl: String): Builder =
+            Builder(apiKey, endpointFromBaseUrl(baseUrl))
+
+        @JvmStatic
+        public fun endpointBuilder(apiKey: String, endpoint: String): Builder =
+            Builder(apiKey, endpoint)
+    }
+}
+
+private fun putContext(context: MutableMap<String, Any>, key: String, value: Any?) {
+    if (value != null && !context.containsKey(key)) {
+        context[key] = value
+    }
+}
+
+private fun firstPresent(first: String?, second: String?): String? {
+    if (!first.isNullOrEmpty()) {
+        return first
+    }
+    return if (second.isNullOrEmpty()) null else second
+}
+
+private fun requireValue(name: String, value: String?): String {
+    require(!value.isNullOrBlank()) { "$name is required" }
+    return value
+}
+
+private fun endpointFromBaseUrl(baseUrl: String): String {
+    val normalized = requireValue("baseUrl", baseUrl).replace(Regex("/+$"), "")
+    return "$normalized/api/v1/ingest_events"
+}
+
