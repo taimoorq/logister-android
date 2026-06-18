@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "org.logister"
-version = providers.gradleProperty("VERSION_NAME").orNull ?: "0.1.0-SNAPSHOT"
+version = providers.gradleProperty("VERSION_NAME").orNull ?: "0.1.1-SNAPSHOT"
 
 android {
     namespace = "org.logister.android"
@@ -35,7 +35,7 @@ dependencies {
 }
 
 mavenPublishing {
-    publishToMavenCentral()
+    publishToMavenCentral(automaticRelease = true)
     signAllPublications()
 
     coordinates("org.logister", "logister-android", version.toString())

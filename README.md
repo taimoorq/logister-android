@@ -21,7 +21,7 @@ Install the Android SDK from Maven Central:
 
 ```kotlin
 dependencies {
-    implementation("org.logister:logister-android:0.1.0")
+    implementation("org.logister:logister-android:0.1.1")
 }
 ```
 
@@ -49,16 +49,18 @@ The release workflow uses GitHub Actions secrets, not checked-in credentials:
 - `SIGNING_KEY`
 - `SIGNING_PASSWORD`
 
-Push a semantic version tag to upload a signed deployment to Central Portal:
+After CI passes on `main`, the release-from-main workflow creates the matching
+version tag from `gradle.properties` and dispatches the release workflow. You
+can also push a semantic version tag manually:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
-After the workflow succeeds, review the deployment in Sonatype Central Portal
-and click **Publish**. The workflow intentionally uploads without automatically
-publishing so signed artifacts can be inspected before sync to Maven Central.
+After the workflow succeeds, the signed artifacts are automatically released
+through Maven Central Portal and may take a few minutes to appear in Maven
+Central.
 
 ## Kotlin Usage
 
@@ -75,6 +77,9 @@ val client = logisterClient(
 ) {
     environment("production")
     release("${BuildConfig.VERSION_NAME}+${BuildConfig.VERSION_CODE}")
+    repository("acme/android-app")
+    commitSha(BuildConfig.GIT_SHA)
+    branch(BuildConfig.GIT_BRANCH)
     packageName(BuildConfig.APPLICATION_ID)
     appVersion(BuildConfig.VERSION_NAME)
     buildNumber(BuildConfig.VERSION_CODE.toString())
@@ -98,6 +103,11 @@ try {
     client.captureExceptionAsync(exception)
 }
 ```
+
+When the Logister project is connected to a GitHub repository, `repository`,
+`commitSha`, and `branch` help source-aware error details resolve frames to the
+right code. CI/CD systems should record release-to-commit deployment mappings
+with the Logister HTTP API `POST /api/v1/deployments` endpoint.
 
 ## Spans And Check-ins
 

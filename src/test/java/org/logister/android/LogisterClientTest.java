@@ -16,6 +16,9 @@ public final class LogisterClientTest {
         LogisterClient client = testClient(transport)
                 .environment("production")
                 .release("1.0.0+42")
+                .repository("acme/android")
+                .commitSha("abc1234")
+                .branch("main")
                 .service("com.example.app")
                 .build();
 
@@ -42,6 +45,9 @@ public final class LogisterClientTest {
         assertEquals("1.0.0+42", event.getString("release"));
         assertEquals("android", context.getString("platform"));
         assertEquals("com.example.app", context.getString("service"));
+        assertEquals("acme/android", context.getString("repository"));
+        assertEquals("abc1234", context.getString("commit_sha"));
+        assertEquals("main", context.getString("branch"));
         assertEquals("session-123", context.getString("session_id"));
         assertEquals("Checkout", context.getString("screen_name"));
         assertEquals(3.0, context.getDouble("value"), 0.001);

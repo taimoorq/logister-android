@@ -27,7 +27,7 @@ public class HttpUrlConnectionLogisterTransport : LogisterTransport {
         connection.setRequestProperty("Authorization", "Bearer $apiKey")
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
         connection.setRequestProperty("Accept", "application/json")
-        connection.setRequestProperty("User-Agent", "logister-android/0.1.0")
+        connection.setRequestProperty("User-Agent", "logister-android/0.1.1")
 
         connection.outputStream.use { outputStream ->
             outputStream.write(payload)
@@ -57,4 +57,3 @@ public class HttpUrlConnectionLogisterTransport : LogisterTransport {
         return body.toString()
     }
 }
-

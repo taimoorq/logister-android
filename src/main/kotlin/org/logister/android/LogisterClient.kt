@@ -13,6 +13,9 @@ public class LogisterClient private constructor(
     private val endpoint: String,
     private val environment: String?,
     private val release: String?,
+    private val repository: String?,
+    private val commitSha: String?,
+    private val branch: String?,
     private val service: String?,
     private val packageName: String?,
     private val appVersion: String?,
@@ -187,6 +190,9 @@ public class LogisterClient private constructor(
         putContext(context, "app_version", appVersion)
         putContext(context, "build_number", buildNumber)
         putContext(context, "build_type", buildType)
+        putContext(context, "repository", repository)
+        putContext(context, "commit_sha", commitSha)
+        putContext(context, "branch", branch)
         context.putAll(defaultContext)
 
         if (includeDeviceContext) {
@@ -207,6 +213,9 @@ public class LogisterClient private constructor(
     ) {
         private var environment: String? = null
         private var release: String? = null
+        private var repository: String? = null
+        private var commitSha: String? = null
+        private var branch: String? = null
         private var service: String? = null
         private var packageName: String? = null
         private var appVersion: String? = null
@@ -225,6 +234,18 @@ public class LogisterClient private constructor(
 
         public fun release(release: String?): Builder = apply {
             this.release = release
+        }
+
+        public fun repository(repository: String?): Builder = apply {
+            this.repository = repository
+        }
+
+        public fun commitSha(commitSha: String?): Builder = apply {
+            this.commitSha = commitSha
+        }
+
+        public fun branch(branch: String?): Builder = apply {
+            this.branch = branch
         }
 
         public fun service(service: String?): Builder = apply {
@@ -286,6 +307,9 @@ public class LogisterClient private constructor(
                 endpoint = requireValue("endpoint", endpoint),
                 environment = environment,
                 release = release,
+                repository = repository,
+                commitSha = commitSha,
+                branch = branch,
                 service = service,
                 packageName = packageName,
                 appVersion = appVersion,
@@ -333,4 +357,3 @@ private fun endpointFromBaseUrl(baseUrl: String): String {
     val normalized = requireValue("baseUrl", baseUrl).replace(Regex("/+$"), "")
     return "$normalized/api/v1/ingest_events"
 }
-
