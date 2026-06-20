@@ -9,7 +9,7 @@ import org.json.JSONObject
 
 /** Main Android client for sending telemetry to Logister. */
 public class LogisterClient private constructor(
-    private val apiKey: String,
+    private val tokenProvider: LogisterTokenProvider,
     private val endpoint: String,
     private val environment: String?,
     private val release: String?,
@@ -25,9 +25,13 @@ public class LogisterClient private constructor(
     private val includeDeviceContext: Boolean,
     private val connectTimeoutMs: Int,
     private val readTimeoutMs: Int,
+    private val tokenRefreshSkewSeconds: Long,
     private val transport: LogisterTransport,
     private val executor: ExecutorService
 ) {
+    @Volatile
+    private var cachedToken: LogisterToken? = null
+
     public fun captureAsync(event: LogisterEvent): Future<LogisterResponse> =
         captureAsync(event, LogisterEventOptions.EMPTY)
 
@@ -45,7 +49,30 @@ public class LogisterClient private constructor(
     public fun capture(event: LogisterEvent, options: LogisterEventOptions?): LogisterResponse {
         val envelope = JSONObject()
         envelope.put("event", buildEventPayload(event, options ?: LogisterEventOptions.EMPTY))
-        return transport.send(endpoint, apiKey, envelope, connectTimeoutMs, readTimeoutMs)
+        return transport.send(endpoint, mobileIngestToken(), envelope, connectTimeoutMs, readTimeoutMs)
+    }
+
+    @Throws(Exception::class)
+    private fun mobileIngestToken(): String {
+        val now = System.currentTimeMillis() / 1000
+        val existing = cachedToken
+        if (existing != null && !existing.shouldRefresh(now, tokenRefreshSkewSeconds)) {
+            return existing.token
+        }
+
+        synchronized(this) {
+            val refreshedNow = System.currentTimeMillis() / 1000
+            val refreshedExisting = cachedToken
+            if (refreshedExisting != null && !refreshedExisting.shouldRefresh(refreshedNow, tokenRefreshSkewSeconds)) {
+                return refreshedExisting.token
+            }
+
+            val fresh = tokenProvider.fetchToken()
+            val token = requireValue("mobileIngestToken", fresh.token)
+            require(!fresh.isExpired(refreshedNow)) { "mobileIngestToken is expired" }
+            cachedToken = fresh
+            return token
+        }
     }
 
     public fun captureExceptionAsync(throwable: Throwable): Future<LogisterResponse> =
@@ -208,7 +235,7 @@ public class LogisterClient private constructor(
     }
 
     public class Builder internal constructor(
-        private val apiKey: String,
+        private val tokenProvider: LogisterTokenProvider,
         private val endpoint: String
     ) {
         private var environment: String? = null
@@ -225,6 +252,7 @@ public class LogisterClient private constructor(
         private var includeDeviceContext: Boolean = true
         private var connectTimeoutMs: Int = 10_000
         private var readTimeoutMs: Int = 10_000
+        private var tokenRefreshSkewSeconds: Long = 60
         private var transport: LogisterTransport = HttpUrlConnectionLogisterTransport()
         private var executor: ExecutorService = Executors.newSingleThreadExecutor()
 
@@ -289,6 +317,10 @@ public class LogisterClient private constructor(
             this.readTimeoutMs = readTimeoutMs
         }
 
+        public fun tokenRefreshSkewSeconds(tokenRefreshSkewSeconds: Long): Builder = apply {
+            this.tokenRefreshSkewSeconds = tokenRefreshSkewSeconds
+        }
+
         public fun transport(transport: LogisterTransport?): Builder = apply {
             if (transport != null) {
                 this.transport = transport
@@ -303,7 +335,7 @@ public class LogisterClient private constructor(
 
         public fun build(): LogisterClient =
             LogisterClient(
-                apiKey = requireValue("apiKey", apiKey),
+                tokenProvider = tokenProvider,
                 endpoint = requireValue("endpoint", endpoint),
                 environment = environment,
                 release = release,
@@ -319,6 +351,7 @@ public class LogisterClient private constructor(
                 includeDeviceContext = includeDeviceContext,
                 connectTimeoutMs = connectTimeoutMs,
                 readTimeoutMs = readTimeoutMs,
+                tokenRefreshSkewSeconds = tokenRefreshSkewSeconds,
                 transport = transport,
                 executor = executor
             )
@@ -326,12 +359,12 @@ public class LogisterClient private constructor(
 
     public companion object {
         @JvmStatic
-        public fun builder(apiKey: String, baseUrl: String): Builder =
-            Builder(apiKey, endpointFromBaseUrl(baseUrl))
+        public fun builder(tokenProvider: LogisterTokenProvider, baseUrl: String): Builder =
+            Builder(tokenProvider, endpointFromBaseUrl(baseUrl))
 
         @JvmStatic
-        public fun endpointBuilder(apiKey: String, endpoint: String): Builder =
-            Builder(apiKey, endpoint)
+        public fun endpointBuilder(tokenProvider: LogisterTokenProvider, endpoint: String): Builder =
+            Builder(tokenProvider, endpoint)
     }
 }
 

@@ -13,7 +13,7 @@ public class HttpUrlConnectionLogisterTransport : LogisterTransport {
     @Throws(Exception::class)
     override fun send(
         endpoint: String,
-        apiKey: String,
+        mobileIngestToken: String,
         envelope: JSONObject,
         connectTimeoutMs: Int,
         readTimeoutMs: Int
@@ -24,10 +24,10 @@ public class HttpUrlConnectionLogisterTransport : LogisterTransport {
         connection.connectTimeout = connectTimeoutMs
         connection.readTimeout = readTimeoutMs
         connection.doOutput = true
-        connection.setRequestProperty("Authorization", "Bearer $apiKey")
+        connection.setRequestProperty("Authorization", "Bearer $mobileIngestToken")
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
         connection.setRequestProperty("Accept", "application/json")
-        connection.setRequestProperty("User-Agent", "logister-android/0.1.1")
+        connection.setRequestProperty("User-Agent", "logister-android/0.1.2")
 
         connection.outputStream.use { outputStream ->
             outputStream.write(payload)

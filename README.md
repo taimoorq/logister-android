@@ -10,6 +10,7 @@ This repository is the canonical home for the Android package add-on. Build Andr
 - Kotlin core with Java-compatible builders and async APIs for broad Android interop.
 - Dependency-light HTTP transport using `HttpURLConnection`.
 - Injectable transport for tests or alternate networking stacks.
+- Token-provider based authentication with short-lived mobile ingest tokens.
 - Async client methods for errors, logs, metrics, transactions, spans, and check-ins.
 - Capture Android app metadata such as package name, version name, version code, build type, Android version, API level, device model, locale, and session ID.
 
@@ -21,7 +22,7 @@ Install the Android SDK from Maven Central:
 
 ```kotlin
 dependencies {
-    implementation("org.logister:logister-android:0.1.1")
+    implementation("org.logister:logister-android:0.1.2")
 }
 ```
 
@@ -54,8 +55,8 @@ version tag from `gradle.properties` and dispatches the release workflow. You
 can also push a semantic version tag manually:
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 After the workflow succeeds, the signed artifacts are automatically released
@@ -64,16 +65,32 @@ Central.
 
 ## Kotlin Usage
 
+Do not compile a Logister project API key into an Android app. The Android SDK
+requires a `LogisterTokenProvider`; implement it by calling your own backend.
+Your backend should authenticate the app/session, use its server-side Logister
+project API key to mint a short-lived token with
+`POST /api/v1/mobile_ingest_tokens`, and return that token to the app.
+
 ```kotlin
 import org.logister.android.captureExceptionAsync
 import org.logister.android.captureMetricAsync
 import org.logister.android.captureMessageAsync
 import org.logister.android.captureTransactionAsync
+import org.logister.android.LogisterToken
+import org.logister.android.LogisterTokenProvider
 import org.logister.android.logisterClient
 
+class AppBackendTokenProvider : LogisterTokenProvider {
+    override fun fetchToken(): LogisterToken {
+        // Call your app backend, not Logister directly. Return the token and
+        // expires_at value from your backend's mobile token response.
+        return LogisterToken("short-lived-mobile-token", System.currentTimeMillis() / 1000 + 900)
+    }
+}
+
 val client = logisterClient(
-    apiKey = "your-project-api-token",
-    baseUrl = "https://your-logister-host.example"
+    baseUrl = "https://your-logister-host.example",
+    tokenProvider = AppBackendTokenProvider()
 ) {
     environment("production")
     release("${BuildConfig.VERSION_NAME}+${BuildConfig.VERSION_CODE}")
@@ -135,8 +152,8 @@ client.checkInAsync("daily-sync", "ok") {
 ## Java Interop
 
 The Kotlin client classes remain Java-friendly, so Java apps can still use
-`LogisterClient.builder(...)`, `LogisterEventOptions.builder(...)`, and
-`LogisterSpan.builder(...)` directly.
+`LogisterClient.builder(tokenProvider, baseUrl)`,
+`LogisterEventOptions.builder(...)`, and `LogisterSpan.builder(...)` directly.
 
 ## Verification
 
@@ -152,11 +169,12 @@ If your Android SDK is installed outside the default location, set
 ## Public Repository Hygiene
 
 This repository is designed to be public and open source. Keep examples generic:
-use placeholder API tokens, example hostnames, and environment variables instead
-of real project credentials.
+use placeholder short-lived mobile tokens, example hostnames, and environment
+variables instead of real project credentials.
 
-Do not commit Android signing keys, Logister project API keys, Cloudflare
-tokens, Maven Central credentials, `.env` files, or `local.properties`.
+Do not commit Android signing keys, Logister project API keys, mobile token
+issuer secrets, Cloudflare tokens, Maven Central credentials, `.env` files, or
+`local.properties`.
 
 CI runs `scripts/secret-scan.sh`, and dependency updates are tracked by
 `.github/dependabot.yml` for Gradle and GitHub Actions.

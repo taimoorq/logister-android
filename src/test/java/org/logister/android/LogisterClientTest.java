@@ -3,11 +3,15 @@ package org.logister.android;
 import org.json.JSONObject;
 import org.junit.Test;
 
+import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutionException;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public final class LogisterClientTest {
     @Test
@@ -34,7 +38,7 @@ public final class LogisterClientTest {
 
         assertTrue(response.isAccepted());
         assertEquals("https://logister.example/api/v1/ingest_events", transport.endpoint);
-        assertEquals("test-token", transport.apiKey);
+        assertEquals("mobile-token-1", transport.mobileIngestToken);
 
         JSONObject event = transport.envelope.getJSONObject("event");
         JSONObject context = event.getJSONObject("context");
@@ -101,8 +105,57 @@ public final class LogisterClientTest {
         assertNotNull(exception.getJSONArray("stacktrace"));
     }
 
+    @Test
+    public void providerFailureDoesNotSendRequest() throws Exception {
+        CapturingTransport transport = new CapturingTransport();
+        LogisterClient client = LogisterClient.builder(
+                        () -> {
+                            throw new IllegalStateException("token issuer unavailable");
+                        },
+                        "https://logister.example"
+                )
+                .includeDeviceContext(false)
+                .transport(transport)
+                .executor(Executors.newSingleThreadExecutor())
+                .build();
+
+        try {
+            client.captureMessageAsync("one").get();
+            fail("Expected token provider failure");
+        } catch (ExecutionException exception) {
+            assertTrue(exception.getCause() instanceof IllegalStateException);
+        }
+
+        assertEquals(0, transport.sendCount);
+    }
+
+    @Test
+    public void expiredTokenDoesNotSendRequest() throws Exception {
+        CapturingTransport transport = new CapturingTransport();
+        LogisterClient client = LogisterClient.builder(
+                        new SequenceTokenProvider(new LogisterToken("expired-token", nowEpochSeconds() - 1)),
+                        "https://logister.example"
+                )
+                .includeDeviceContext(false)
+                .transport(transport)
+                .executor(Executors.newSingleThreadExecutor())
+                .build();
+
+        try {
+            client.captureMessageAsync("one").get();
+            fail("Expected expired token failure");
+        } catch (ExecutionException exception) {
+            assertTrue(exception.getCause() instanceof IllegalArgumentException);
+        }
+
+        assertEquals(0, transport.sendCount);
+    }
+
     private static LogisterClient.Builder testClient(CapturingTransport transport) {
-        return LogisterClient.builder("test-token", "https://logister.example")
+        return LogisterClient.builder(
+                        new SequenceTokenProvider(new LogisterToken("mobile-token-1", nowEpochSeconds() + 300)),
+                        "https://logister.example"
+                )
                 .includeDeviceContext(false)
                 .transport(transport)
                 .executor(Executors.newSingleThreadExecutor());
@@ -110,21 +163,40 @@ public final class LogisterClientTest {
 
     private static final class CapturingTransport implements LogisterTransport {
         private String endpoint;
-        private String apiKey;
+        private String mobileIngestToken;
         private JSONObject envelope;
+        private int sendCount;
 
         @Override
         public LogisterResponse send(
                 String endpoint,
-                String apiKey,
+                String mobileIngestToken,
                 JSONObject envelope,
                 int connectTimeoutMs,
                 int readTimeoutMs
         ) {
+            sendCount += 1;
             this.endpoint = endpoint;
-            this.apiKey = apiKey;
+            this.mobileIngestToken = mobileIngestToken;
             this.envelope = envelope;
             return new LogisterResponse(201, "{\"status\":\"accepted\"}");
         }
+    }
+
+    private static final class SequenceTokenProvider implements LogisterTokenProvider {
+        private final ArrayDeque<LogisterToken> tokens;
+
+        private SequenceTokenProvider(LogisterToken... tokens) {
+            this.tokens = new ArrayDeque<>(Arrays.asList(tokens));
+        }
+
+        @Override
+        public LogisterToken fetchToken() {
+            return tokens.size() > 1 ? tokens.removeFirst() : tokens.peekFirst();
+        }
+    }
+
+    private static long nowEpochSeconds() {
+        return System.currentTimeMillis() / 1000;
     }
 }

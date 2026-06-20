@@ -1,16 +1,22 @@
 package org.logister.android
 
 import java.util.concurrent.Executors
+import java.util.concurrent.ExecutionException
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class LogisterKotlinTest {
     @Test
     fun kotlinFacadeBuildsMetricEnvelope() {
         val transport = CapturingTransport()
-        val client = logisterClient("test-token", "https://logister.example") {
+        val tokenProvider = SequenceTokenProvider(LogisterToken("mobile-token-1", futureEpochSeconds()))
+        val client = logisterClient(
+            baseUrl = "https://logister.example",
+            tokenProvider = tokenProvider
+        ) {
             includeDeviceContext(false)
             environment("production")
             release("1.0.0+42")
@@ -29,7 +35,8 @@ class LogisterKotlinTest {
 
         assertTrue(response.isAccepted)
         assertEquals("https://logister.example/api/v1/ingest_events", transport.endpoint)
-        assertEquals("test-token", transport.apiKey)
+        assertEquals("mobile-token-1", transport.mobileIngestToken)
+        assertEquals(1, tokenProvider.fetchCount)
 
         val event = transport.envelope.getJSONObject("event")
         val context = event.getJSONObject("context")
@@ -52,7 +59,10 @@ class LogisterKotlinTest {
     @Test
     fun kotlinFacadeBuildsSpanEnvelope() {
         val transport = CapturingTransport()
-        val client = logisterClient("test-token", "https://logister.example") {
+        val client = logisterClient(
+            baseUrl = "https://logister.example",
+            tokenProvider = SequenceTokenProvider(LogisterToken("mobile-token-1", futureEpochSeconds()))
+        ) {
             includeDeviceContext(false)
             transport(transport)
             executor(Executors.newSingleThreadExecutor())
@@ -82,22 +92,128 @@ class LogisterKotlinTest {
         assertEquals("Checkout", context.getString("screen_name"))
     }
 
+    @Test
+    fun clientCachesTokenUntilRefreshWindow() {
+        val transport = CapturingTransport()
+        val tokenProvider = SequenceTokenProvider(LogisterToken("mobile-token-1", futureEpochSeconds(300)))
+        val client = logisterClient(
+            baseUrl = "https://logister.example",
+            tokenProvider = tokenProvider
+        ) {
+            includeDeviceContext(false)
+            transport(transport)
+            executor(Executors.newSingleThreadExecutor())
+        }
+
+        client.captureMessageAsync("one").get()
+        client.captureMessageAsync("two").get()
+
+        assertEquals(1, tokenProvider.fetchCount)
+        assertEquals(listOf("mobile-token-1", "mobile-token-1"), transport.mobileIngestTokens)
+    }
+
+    @Test
+    fun clientRefreshesCachedTokenInsideRefreshWindow() {
+        val transport = CapturingTransport()
+        val tokenProvider = SequenceTokenProvider(
+            LogisterToken("mobile-token-1", futureEpochSeconds(30)),
+            LogisterToken("mobile-token-2", futureEpochSeconds(300))
+        )
+        val client = logisterClient(
+            baseUrl = "https://logister.example",
+            tokenProvider = tokenProvider
+        ) {
+            includeDeviceContext(false)
+            transport(transport)
+            executor(Executors.newSingleThreadExecutor())
+        }
+
+        client.captureMessageAsync("one").get()
+        client.captureMessageAsync("two").get()
+
+        assertEquals(2, tokenProvider.fetchCount)
+        assertEquals(listOf("mobile-token-1", "mobile-token-2"), transport.mobileIngestTokens)
+    }
+
+    @Test
+    fun providerFailureDoesNotSendRequest() {
+        val transport = CapturingTransport()
+        val client = logisterClient(
+            baseUrl = "https://logister.example",
+            tokenProvider = LogisterTokenProvider { throw IllegalStateException("token issuer unavailable") }
+        ) {
+            includeDeviceContext(false)
+            transport(transport)
+            executor(Executors.newSingleThreadExecutor())
+        }
+
+        try {
+            client.captureMessageAsync("one").get()
+            fail("Expected token provider failure")
+        } catch (exception: ExecutionException) {
+            assertTrue(exception.cause is IllegalStateException)
+        }
+
+        assertEquals(0, transport.sendCount)
+    }
+
+    @Test
+    fun blankTokenDoesNotSendRequest() {
+        val transport = CapturingTransport()
+        val client = logisterClient(
+            baseUrl = "https://logister.example",
+            tokenProvider = SequenceTokenProvider(LogisterToken("", futureEpochSeconds()))
+        ) {
+            includeDeviceContext(false)
+            transport(transport)
+            executor(Executors.newSingleThreadExecutor())
+        }
+
+        try {
+            client.captureMessageAsync("one").get()
+            fail("Expected blank token failure")
+        } catch (exception: ExecutionException) {
+            assertTrue(exception.cause is IllegalArgumentException)
+        }
+
+        assertEquals(0, transport.sendCount)
+    }
+
     private class CapturingTransport : LogisterTransport {
         lateinit var endpoint: String
-        lateinit var apiKey: String
+        lateinit var mobileIngestToken: String
         lateinit var envelope: JSONObject
+        val mobileIngestTokens = mutableListOf<String>()
+        var sendCount = 0
 
         override fun send(
             endpoint: String,
-            apiKey: String,
+            mobileIngestToken: String,
             envelope: JSONObject,
             connectTimeoutMs: Int,
             readTimeoutMs: Int
         ): LogisterResponse {
+            sendCount += 1
             this.endpoint = endpoint
-            this.apiKey = apiKey
+            this.mobileIngestToken = mobileIngestToken
+            this.mobileIngestTokens.add(mobileIngestToken)
             this.envelope = envelope
             return LogisterResponse(201, """{"status":"accepted"}""")
         }
     }
+
+    private class SequenceTokenProvider(
+        vararg tokens: LogisterToken
+    ) : LogisterTokenProvider {
+        private val tokens = ArrayDeque(tokens.toList())
+        var fetchCount = 0
+
+        override fun fetchToken(): LogisterToken {
+            fetchCount += 1
+            return if (tokens.size > 1) tokens.removeFirst() else tokens.first()
+        }
+    }
+
+    private fun futureEpochSeconds(seconds: Long = 300): Long =
+        System.currentTimeMillis() / 1000 + seconds
 }

@@ -5,18 +5,18 @@ package org.logister.android
 import java.util.concurrent.Future
 
 public fun logisterClient(
-    apiKey: String,
     baseUrl: String,
+    tokenProvider: LogisterTokenProvider,
     configure: LogisterClient.Builder.() -> Unit = {}
 ): LogisterClient =
-    LogisterClient.builder(apiKey, baseUrl).apply(configure).build()
+    LogisterClient.builder(tokenProvider, baseUrl).apply(configure).build()
 
 public fun logisterClientForEndpoint(
-    apiKey: String,
     endpoint: String,
+    tokenProvider: LogisterTokenProvider,
     configure: LogisterClient.Builder.() -> Unit = {}
 ): LogisterClient =
-    LogisterClient.endpointBuilder(apiKey, endpoint).apply(configure).build()
+    LogisterClient.endpointBuilder(tokenProvider, endpoint).apply(configure).build()
 
 public fun logisterEventOptions(
     configure: LogisterEventOptions.Builder.() -> Unit = {}
