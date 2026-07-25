@@ -22,7 +22,7 @@ Install the Android SDK from Maven Central:
 
 ```kotlin
 dependencies {
-    implementation("org.logister:logister-android:0.1.2")
+    implementation("org.logister:logister-android:0.1.3")
 }
 ```
 
@@ -51,12 +51,12 @@ The release workflow uses GitHub Actions secrets, not checked-in credentials:
 - `SIGNING_PASSWORD`
 
 After CI passes on `main`, the release-from-main workflow creates the matching
-version tag from `gradle.properties` and dispatches the release workflow. You
-can also push a semantic version tag manually:
+version tag from `gradle.properties`; pushing that tag starts the release
+workflow. You can also push a semantic version tag manually:
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 After the workflow succeeds, the signed artifacts are automatically released

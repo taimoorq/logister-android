@@ -27,7 +27,7 @@ public class HttpUrlConnectionLogisterTransport : LogisterTransport {
         connection.setRequestProperty("Authorization", "Bearer $mobileIngestToken")
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
         connection.setRequestProperty("Accept", "application/json")
-        connection.setRequestProperty("User-Agent", "logister-android/0.1.2")
+        connection.setRequestProperty("User-Agent", "logister-android/0.1.3")
 
         connection.outputStream.use { outputStream ->
             outputStream.write(payload)
