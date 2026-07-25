@@ -1,10 +1,21 @@
 # logister-android
 
-Android SDK for Logister.
+Android SDK for sending errors, logs, metrics, transactions, spans, and scheduled-job check-ins to Logister.
 
-This repository is the canonical home for the Android package add-on. Build Android client source, Gradle configuration, examples, tests, and release notes here rather than inside the Rails app.
+The package supports Kotlin and Java applications on Android 6.0 (API 23) and newer. It uses `HttpURLConnection`, adds no third-party runtime networking dependency, and publishes as `org.logister:logister-android` on Maven Central.
 
-## Current Scope
+## Before you start
+
+Do not compile a long-lived Logister project API key into an Android app. Mobile apps must ask your own authenticated backend for a short-lived token. Your backend mints that token with `POST /api/v1/mobile_ingest_tokens`; the Android SDK caches it until it is close to expiring.
+
+The request path is:
+
+```text
+Android app → your authenticated backend → Logister mobile token endpoint
+Android app → Logister ingest endpoint with the short-lived token
+```
+
+## What it supports
 
 - Single-module Android library configured for Gradle and Maven publication.
 - Kotlin core with Java-compatible builders and async APIs for broad Android interop.
@@ -12,9 +23,9 @@ This repository is the canonical home for the Android package add-on. Build Andr
 - Injectable transport for tests or alternate networking stacks.
 - Token-provider based authentication with short-lived mobile ingest tokens.
 - Async client methods for errors, logs, metrics, transactions, spans, and check-ins.
-- Capture Android app metadata such as package name, version name, version code, build type, Android version, API level, device model, locale, and session ID.
+- Configurable app/source context plus automatic Android version, API level, manufacturer, model, and brand context.
 
-Automatic crash, screen, network, retry, and offline-queue instrumentation should remain opt-in while privacy defaults are settled.
+Automatic crash, screen, network, retry, and offline-queue instrumentation is not included in the current package.
 
 ## Install
 
@@ -28,69 +39,73 @@ dependencies {
 
 - Maven Central: https://central.sonatype.com/artifact/org.logister/logister-android
 - Maven repository path: https://repo1.maven.org/maven2/org/logister/logister-android/
-- Android integration docs: https://docs.logister.org/integrations/android/
+- Android integration docs: https://logister.org/docs/integrations/android/
 
 For local development, open this repository as an Android library project or include it as a composite build from an Android app.
 
-## Maven Central Release
+## Quick start
 
-The Maven coordinates are:
+Implement `LogisterTokenProvider` with your existing API client. The interface below represents the endpoint you add to your own backend:
 
-```text
-org.logister:logister-android:<version>
+```kotlin
+import org.logister.android.LogisterToken
+import org.logister.android.LogisterTokenProvider
+import org.logister.android.captureExceptionAsync
+import org.logister.android.logisterClient
+
+data class MobileTokenResponse(
+    val token: String,
+    val expiresAtEpochSeconds: Long
+)
+
+interface AppBackend {
+    fun fetchLogisterMobileToken(): MobileTokenResponse
+}
+
+class AppBackendTokenProvider(
+    private val appBackend: AppBackend
+) : LogisterTokenProvider {
+    override fun fetchToken(): LogisterToken {
+        val response = appBackend.fetchLogisterMobileToken()
+        return LogisterToken(response.token, response.expiresAtEpochSeconds)
+    }
+}
+
+fun sendReadmeTest(appBackend: AppBackend) {
+    val logister = logisterClient(
+        baseUrl = "https://logister.example.com",
+        tokenProvider = AppBackendTokenProvider(appBackend)
+    ) {
+        environment("development")
+        release(BuildConfig.VERSION_NAME)
+        packageName(BuildConfig.APPLICATION_ID)
+        appVersion(BuildConfig.VERSION_NAME)
+        buildNumber(BuildConfig.VERSION_CODE.toString())
+    }
+
+    logister.captureExceptionAsync(IllegalStateException("README test error")) {
+        fingerprint("readme-test-error")
+        context("screen_name", "Checkout")
+    }
+}
 ```
 
-The `org.logister` namespace is verified in Sonatype Central Portal. Release
-signing uses an in-memory GPG key from GitHub Actions secrets.
-
-The release workflow uses GitHub Actions secrets, not checked-in credentials:
-
-- `MAVEN_CENTRAL_USERNAME`
-- `MAVEN_CENTRAL_PASSWORD`
-- `SIGNING_KEY`
-- `SIGNING_PASSWORD`
-
-After CI passes on `main`, the release-from-main workflow creates the matching
-version tag from `gradle.properties`; pushing that tag starts the release
-workflow. You can also push a semantic version tag manually:
-
-```bash
-git tag v0.1.3
-git push origin v0.1.3
-```
-
-After the workflow succeeds, the signed artifacts are automatically released
-through Maven Central Portal and may take a few minutes to appear in Maven
-Central.
+The capture methods enqueue work on the client's background executor and return a `Future<LogisterResponse>`. Do not block the Android main thread by calling `Future.get()` there. Open the Logister project inbox and confirm that **README test error** appears.
 
 ## Kotlin Usage
 
-Do not compile a Logister project API key into an Android app. The Android SDK
-requires a `LogisterTokenProvider`; implement it by calling your own backend.
-Your backend should authenticate the app/session, use its server-side Logister
-project API key to mint a short-lived token with
-`POST /api/v1/mobile_ingest_tokens`, and return that token to the app.
+Building on `AppBackendTokenProvider` from the quick start, this example adds source context and sends several telemetry types.
 
 ```kotlin
 import org.logister.android.captureExceptionAsync
 import org.logister.android.captureMetricAsync
 import org.logister.android.captureMessageAsync
 import org.logister.android.captureTransactionAsync
-import org.logister.android.LogisterToken
-import org.logister.android.LogisterTokenProvider
 import org.logister.android.logisterClient
-
-class AppBackendTokenProvider : LogisterTokenProvider {
-    override fun fetchToken(): LogisterToken {
-        // Call your app backend, not Logister directly. Return the token and
-        // expires_at value from your backend's mobile token response.
-        return LogisterToken("short-lived-mobile-token", System.currentTimeMillis() / 1000 + 900)
-    }
-}
 
 val client = logisterClient(
     baseUrl = "https://your-logister-host.example",
-    tokenProvider = AppBackendTokenProvider()
+    tokenProvider = AppBackendTokenProvider(appBackend)
 ) {
     environment("production")
     release("${BuildConfig.VERSION_NAME}+${BuildConfig.VERSION_CODE}")
@@ -155,18 +170,63 @@ The Kotlin client classes remain Java-friendly, so Java apps can still use
 `LogisterClient.builder(tokenProvider, baseUrl)`,
 `LogisterEventOptions.builder(...)`, and `LogisterSpan.builder(...)` directly.
 
-## Verification
+```java
+import org.logister.android.LogisterClient;
+import org.logister.android.LogisterEventOptions;
+import org.logister.android.LogisterToken;
+import org.logister.android.LogisterTokenProvider;
 
-Run the Android unit tests with:
+LogisterTokenProvider tokenProvider = () -> {
+    MobileTokenResponse response = appBackend.fetchLogisterMobileToken();
+    return new LogisterToken(response.getToken(), response.getExpiresAtEpochSeconds());
+};
+
+LogisterClient client = LogisterClient
+    .builder(tokenProvider, "https://logister.example.com")
+    .environment("development")
+    .service("checkout-android")
+    .build();
+
+client.captureExceptionAsync(
+    new IllegalStateException("README test error"),
+    LogisterEventOptions.builder()
+        .fingerprint("readme-test-error")
+        .build()
+);
+```
+
+## Development
+
+Run the same checks used for release validation with a configured Android SDK:
 
 ```bash
-./gradlew test
+./gradlew clean check javaDocReleaseGeneration --no-daemon
+bash scripts/secret-scan.sh
 ```
 
 If your Android SDK is installed outside the default location, set
 `ANDROID_HOME` before running Gradle.
 
-## Public Repository Hygiene
+## Maven Central release
+
+The Maven coordinates are `org.logister:logister-android:<version>`. The `org.logister` namespace is verified in Sonatype Central Portal, and GitHub Actions signs releases with an in-memory GPG key.
+
+The release workflow uses these GitHub Actions secrets:
+
+- `MAVEN_CENTRAL_USERNAME`
+- `MAVEN_CENTRAL_PASSWORD`
+- `SIGNING_KEY`
+- `SIGNING_PASSWORD`
+
+After CI passes on `main`, the release-from-main workflow creates the version tag from `gradle.properties` and explicitly dispatches `release.yml`. The release tests, signs, and uploads the package before creating the GitHub Release. Wait for both the public POM and AAR before calling the release complete:
+
+```bash
+curl -fsSI https://repo1.maven.org/maven2/org/logister/logister-android/X.Y.Z/logister-android-X.Y.Z.pom
+curl -fsSI https://repo1.maven.org/maven2/org/logister/logister-android/X.Y.Z/logister-android-X.Y.Z.aar
+gh release view vX.Y.Z
+```
+
+## Security and contributing
 
 This repository is designed to be public and open source. Keep examples generic:
 use placeholder short-lived mobile tokens, example hostnames, and environment
@@ -189,5 +249,4 @@ gpg --armor --export-secret-keys YOUR_KEY_ID | gh secret set SIGNING_KEY --repo 
 gh secret set SIGNING_PASSWORD --repo taimoorq/logister-android
 ```
 
-The Rails-side integration plan lives in the `logister` Rails repository under
-`docs/cloudflare-mobile-integrations-plan.md`.
+For server-side token issuance and mobile deployment guidance, read the [Android integration guide](https://logister.org/docs/integrations/android/) and the main app's [mobile add-ons reference](https://github.com/taimoorq/logister/blob/main/docs/mobile-add-ons.md).
