@@ -40,6 +40,9 @@ metadata before retrying. Do not disable dependency verification.
 - Merging a new version to `main` runs CI, creates `vX.Y.Z`, and explicitly
   dispatches `release.yml`. Keep the explicit dispatch because tags pushed with
   `GITHUB_TOKEN` do not start tag-push workflows.
+- Release automation only tags the commit when it is still the tip of `main`.
+  CI validates that `VERSION_NAME`, the changelog heading, and the README Maven
+  coordinate agree before running the full release check suite.
 - The release tests, signs, and uploads an automatic Sonatype Central Portal
   deployment before creating the GitHub Release. The upload task may finish
   while Central says the deployment is being published; wait for the public

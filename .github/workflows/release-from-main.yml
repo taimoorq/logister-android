@@ -13,6 +13,10 @@ permissions:
   actions: write
   contents: write
 
+concurrency:
+  group: release-from-main
+  cancel-in-progress: false
+
 jobs:
   release:
     if: github.event.workflow_run.conclusion == 'success'
@@ -23,37 +27,61 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Confirm released commit is current main
+        id: main
+        env:
+          CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          current_main_sha="$(git rev-parse refs/remotes/origin/main)"
+
+          if [ "$CANDIDATE_SHA" = "$current_main_sha" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping release because CI ran for $CANDIDATE_SHA, while main is now $current_main_sha. The successful CI run for current main will handle the release."
+          fi
 
       - name: Resolve release tag
+        if: steps.main.outputs.current == 'true'
         id: version
         run: |
           version="$(sed -nE 's/^VERSION_NAME=(.+)$/\1/p' gradle.properties | head -n 1)"
-
-          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'; then
-            echo "::error::VERSION_NAME must be semantic, for example 0.1.1."
-            exit 1
-          fi
-
-          if echo "$version" | grep -Eq 'SNAPSHOT'; then
-            echo "::error::VERSION_NAME must be a release version, not a snapshot."
-            exit 1
-          fi
+          bash scripts/validate-release-metadata.sh "$version"
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
       - name: Check existing tag
+        if: steps.main.outputs.current == 'true'
         id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            git fetch origin "refs/tags/${{ steps.version.outputs.tag }}:refs/tags/${{ steps.version.outputs.tag }}"
+            tagged_sha="$(git rev-list -n 1 "${{ steps.version.outputs.tag }}")"
+
+            if gh release view "${{ steps.version.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::notice::${{ steps.version.outputs.tag }} already has a GitHub release; no new release is needed."
+            elif curl --fail --silent --head --location "https://repo1.maven.org/maven2/org/logister/logister-android/${{ steps.version.outputs.version }}/logister-android-${{ steps.version.outputs.version }}.pom" >/dev/null; then
+              echo "::notice::${{ steps.version.outputs.tag }} is already on Maven Central; no new package can be published for this version."
+            elif [ "$tagged_sha" != "${{ github.event.workflow_run.head_sha }}" ]; then
+              echo "::error::${{ steps.version.outputs.tag }} already points to $tagged_sha, not the verified main commit ${{ github.event.workflow_run.head_sha }}. Bump VERSION_NAME instead of moving an existing release tag."
+              exit 1
+            else
+              echo "::warning::${{ steps.version.outputs.tag }} exists on this commit without a published release. Re-run the Release workflow from this tag after confirming Maven Central did not accept the version."
+            fi
+
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "${{ steps.version.outputs.tag }} already exists; skipping release dispatch."
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create release tag and dispatch release
-        if: steps.tag.outputs.exists != 'true'
+        if: steps.main.outputs.current == 'true' && steps.tag.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -61,4 +89,15 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${{ steps.version.outputs.tag }}" -m "Release logister-android ${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
-          gh workflow run release.yml --ref "${{ steps.version.outputs.tag }}" -f version="${{ steps.version.outputs.version }}"
+
+          for attempt in 1 2 3; do
+            if gh workflow run release.yml --ref "${{ steps.version.outputs.tag }}" -f version="${{ steps.version.outputs.version }}"; then
+              exit 0
+            fi
+
+            echo "::warning::Release dispatch attempt $attempt failed."
+            sleep 5
+          done
+
+          echo "::error::The tag was created, but the Release workflow could not be dispatched. Re-run Release from ${{ steps.version.outputs.tag }}."
+          exit 1

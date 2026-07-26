@@ -36,5 +36,8 @@ jobs:
       - name: Secret scan
         run: bash scripts/secret-scan.sh
 
-      - name: Run tests
-        run: ./gradlew test
+      - name: Validate release metadata
+        run: bash scripts/validate-release-metadata.sh
+
+      - name: Run release checks
+        run: ./gradlew clean check javaDocReleaseGeneration --no-daemon

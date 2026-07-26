@@ -23,9 +23,10 @@ Android app → Logister ingest endpoint with the short-lived token
 - Injectable transport for tests or alternate networking stacks.
 - Token-provider based authentication with short-lived mobile ingest tokens.
 - Async client methods for errors, logs, metrics, transactions, spans, and check-ins.
-- Configurable app/source context plus automatic Android version, API level, manufacturer, model, and brand context.
+- Versioned canonical app, release, Android OS/API, device, lifecycle, and failure-mechanism context while retaining the original flat field aliases.
+- Opt-in lifecycle sessions, rotating random installation pseudonyms, bounded breadcrumbs, uncaught-exception capture, Android 11+ historical exit/ANR capture, and a bounded disk retry queue.
 
-Automatic crash, screen, network, retry, and offline-queue instrumentation is not included in the current package.
+Automatic collection is disabled until you provide an `Application` and enable each capability. Network spans remain manual.
 
 ## Install
 
@@ -33,7 +34,7 @@ Install the Android SDK from Maven Central:
 
 ```kotlin
 dependencies {
-    implementation("org.logister:logister-android:0.1.3")
+    implementation("org.logister:logister-android:0.2.0")
 }
 ```
 
@@ -116,7 +117,21 @@ val client = logisterClient(
     appVersion(BuildConfig.VERSION_NAME)
     buildNumber(BuildConfig.VERSION_CODE.toString())
     buildType(BuildConfig.BUILD_TYPE)
+    application(myApplication)
+    sessionTracking(true)
+    installationTracking(true, rotationDays = 90)
+    breadcrumbs(capacity = 50)
+    offlineQueue(enabled = true, maxEvents = 30, maxBytes = 512 * 1024)
+    automaticCrashCapture(true)
+    applicationExitCapture(true)
 }
+
+client.addBreadcrumb(
+    LogisterBreadcrumb.builder("Checkout opened")
+        .category("navigation")
+        .data("screen", "Checkout")
+        .build()
+)
 
 client.captureMessageAsync("Checkout opened") {
     context("screen_name", "Checkout")
@@ -132,9 +147,17 @@ client.captureTransactionAsync("screen.load", 184.2) {
 try {
     runCheckout()
 } catch (exception: Exception) {
-    client.captureExceptionAsync(exception)
+    client.captureExceptionAsync(exception) {
+        // Manual capture is a handled/reporting mechanism, not a fatal crash.
+        mechanism("handled_exception")
+        handled(true)
+    }
 }
 ```
+
+The installation pseudonym is generated randomly, SHA-256 encoded, and rotated on the configured schedule. The SDK does not read Android ID, advertising ID, IMEI, or a hardware serial. Keep installation tracking, session tracking, breadcrumbs, and automatic handlers aligned with your consent and privacy policy.
+
+The offline queue stores at most the configured event and byte limits in app-private preferences. A queued response has `isQueued == true` and `isAccepted == false`; it only becomes accepted after a later server response succeeds.
 
 When the Logister project is connected to a GitHub repository, `repository`,
 `commitSha`, and `branch` help source-aware error details resolve frames to the
@@ -224,6 +247,12 @@ After CI passes on `main`, the release-from-main workflow creates the version ta
 curl -fsSI https://repo1.maven.org/maven2/org/logister/logister-android/X.Y.Z/logister-android-X.Y.Z.pom
 curl -fsSI https://repo1.maven.org/maven2/org/logister/logister-android/X.Y.Z/logister-android-X.Y.Z.aar
 gh release view vX.Y.Z
+```
+
+For `0.2.0`, commit the SDK changes with `VERSION_NAME=0.2.0`, its `CHANGELOG.md` section, and the matching README dependency example, then push or merge that commit to `main`. No manual tag is needed. Follow the `CI`, `Release from main`, and `Release` workflows in that order. If automation is interrupted before Maven Central accepts the version, re-run `Release` from the existing tag; never move a tag after publication:
+
+```bash
+gh workflow run release.yml --repo taimoorq/logister-android --ref v0.2.0 -f version=0.2.0
 ```
 
 ## Security and contributing

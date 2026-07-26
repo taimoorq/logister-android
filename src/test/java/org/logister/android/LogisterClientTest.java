@@ -106,6 +106,60 @@ public final class LogisterClientTest {
     }
 
     @Test
+    public void captureExceptionUsesVersionedCanonicalMobileContext() throws Exception {
+        CapturingTransport transport = new CapturingTransport();
+        LogisterClient client = testClient(transport)
+                .packageName("com.acme.shop")
+                .appVersion("2.0.0")
+                .buildNumber("50")
+                .buildType("release")
+                .breadcrumbs(10)
+                .build();
+        client.addBreadcrumb(
+                LogisterBreadcrumb.builder("Checkout opened")
+                        .category("navigation")
+                        .data("screen", "Checkout")
+                        .build()
+        );
+
+        client.captureExceptionAsync(
+                new IllegalStateException("bad checkout"),
+                LogisterEventOptions.builder()
+                        .mechanism("unhandled_exception")
+                        .handled(false)
+                        .inForeground(true)
+                        .screenName("CheckoutActivity")
+                        .sessionId("session-123")
+                        .build()
+        ).get();
+
+        JSONObject context = transport.envelope.getJSONObject("event").getJSONObject("context");
+        assertEquals(2, context.getInt("telemetry_schema_version"));
+        assertEquals("com.acme.shop", context.getJSONObject("app").getString("package_name"));
+        assertEquals("2.0.0", context.getJSONObject("app").getString("version_name"));
+        assertEquals("50", context.getJSONObject("app").getString("version_code"));
+        assertEquals("CheckoutActivity", context.getJSONObject("app").getString("screen"));
+        assertEquals(true, context.getJSONObject("app").getBoolean("in_foreground"));
+        assertEquals("session-123", context.getJSONObject("session").getString("id"));
+        assertEquals("unhandled_exception", context.getJSONObject("error").getString("mechanism"));
+        assertEquals(false, context.getJSONObject("error").getBoolean("handled"));
+        assertEquals(1, context.getJSONArray("breadcrumbs").length());
+    }
+
+    @Test
+    public void applicationBackedFeaturesRequireExplicitApplication() {
+        try {
+            testClient(new CapturingTransport())
+                    .installationTracking(true, 30)
+                    .offlineQueue(true, 10, 64 * 1024)
+                    .build();
+            fail("Expected application requirement");
+        } catch (IllegalArgumentException exception) {
+            assertTrue(exception.getMessage().contains("application is required"));
+        }
+    }
+
+    @Test
     public void providerFailureDoesNotSendRequest() throws Exception {
         CapturingTransport transport = new CapturingTransport();
         LogisterClient client = LogisterClient.builder(

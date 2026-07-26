@@ -46,16 +46,11 @@ jobs:
 
       - name: Verify checked-in version
         run: |
-          expected="$(sed -nE 's/^VERSION_NAME=(.+)$/\1/p' gradle.properties | head -n 1)"
           actual="${{ steps.release_version.outputs.version }}"
+          bash scripts/validate-release-metadata.sh "$actual"
 
-          if [ -z "$expected" ]; then
-            echo "::error::Missing VERSION_NAME in gradle.properties."
-            exit 1
-          fi
-
-          if [ "$actual" != "$expected" ]; then
-            echo "::error::Release version $actual does not match gradle.properties VERSION_NAME $expected."
+          if [ "$GITHUB_REF_TYPE" != "tag" ] || [ "$GITHUB_REF_NAME" != "v$actual" ]; then
+            echo "::error::Release v$actual must run from its exact v$actual tag, not $GITHUB_REF."
             exit 1
           fi
 
@@ -91,8 +86,8 @@ jobs:
       - name: Secret scan
         run: bash scripts/secret-scan.sh
 
-      - name: Run tests
-        run: ./gradlew test -PVERSION_NAME="${{ steps.release_version.outputs.version }}"
+      - name: Run release checks
+        run: ./gradlew clean check javaDocReleaseGeneration --no-daemon -PVERSION_NAME="${{ steps.release_version.outputs.version }}"
 
       - name: Publish signed deployment to Maven Central
         env:

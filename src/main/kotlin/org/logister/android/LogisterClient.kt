@@ -1,10 +1,12 @@
 package org.logister.android
 
+import android.app.Application
 import android.os.Build
 import java.util.LinkedHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import org.json.JSONArray
 import org.json.JSONObject
 
 /** Main Android client for sending telemetry to Logister. */
@@ -27,10 +29,14 @@ public class LogisterClient private constructor(
     private val readTimeoutMs: Int,
     private val tokenRefreshSkewSeconds: Long,
     private val transport: LogisterTransport,
-    private val executor: ExecutorService
+    private val executor: ExecutorService,
+    breadcrumbCapacity: Int
 ) {
     @Volatile
     private var cachedToken: LogisterToken? = null
+    private val breadcrumbBuffer: LogisterBreadcrumbBuffer = LogisterBreadcrumbBuffer(breadcrumbCapacity)
+    @Volatile private var androidIntegration: LogisterAndroidIntegration? = null
+    @Volatile private var offlineQueue: LogisterOfflineQueue? = null
 
     public fun captureAsync(event: LogisterEvent): Future<LogisterResponse> =
         captureAsync(event, LogisterEventOptions.EMPTY)
@@ -49,7 +55,45 @@ public class LogisterClient private constructor(
     public fun capture(event: LogisterEvent, options: LogisterEventOptions?): LogisterResponse {
         val envelope = JSONObject()
         envelope.put("event", buildEventPayload(event, options ?: LogisterEventOptions.EMPTY))
-        return transport.send(endpoint, mobileIngestToken(), envelope, connectTimeoutMs, readTimeoutMs)
+        return deliver(envelope)
+    }
+
+    public fun addBreadcrumb(breadcrumb: LogisterBreadcrumb) {
+        breadcrumbBuffer.add(breadcrumb)
+    }
+
+    public fun queuedEventCount(): Int = offlineQueue?.size() ?: 0
+
+    internal fun attachAndroidIntegration(integration: LogisterAndroidIntegration?) {
+        androidIntegration = integration
+        integration?.attach(this)
+    }
+
+    internal fun attachOfflineQueue(queue: LogisterOfflineQueue?) {
+        offlineQueue = queue
+    }
+
+    @Throws(Exception::class)
+    private fun deliver(envelope: JSONObject): LogisterResponse {
+        val token = mobileIngestToken()
+        offlineQueue?.flush { queuedEnvelope ->
+            try {
+                transport.send(endpoint, token, queuedEnvelope, connectTimeoutMs, readTimeoutMs).isAccepted
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        return try {
+            val response = transport.send(endpoint, token, envelope, connectTimeoutMs, readTimeoutMs)
+            if (response.statusCode == 429 || response.statusCode >= 500) {
+                if (offlineQueue?.enqueue(envelope) == true) LogisterResponse.queued() else response
+            } else {
+                response
+            }
+        } catch (error: Exception) {
+            if (offlineQueue?.enqueue(envelope) == true) LogisterResponse.queued() else throw error
+        }
     }
 
     @Throws(Exception::class)
@@ -83,6 +127,10 @@ public class LogisterClient private constructor(
         options: LogisterEventOptions?
     ): Future<LogisterResponse> =
         captureAsync(exceptionEvent(throwable), options)
+
+    @Throws(Exception::class)
+    public fun captureException(throwable: Throwable, options: LogisterEventOptions? = null): LogisterResponse =
+        capture(exceptionEvent(throwable), options ?: LogisterEventOptions.EMPTY)
 
     public fun captureMessageAsync(message: String): Future<LogisterResponse> =
         captureMessageAsync(message, LogisterEventOptions.EMPTY)
@@ -186,6 +234,46 @@ public class LogisterClient private constructor(
         putContext(context, "transaction_name", options.transactionName)
         putContext(context, "duration_ms", options.durationMs)
 
+        val runtime = androidIntegration
+        val sessionId = firstPresent(options.sessionId, runtime?.currentSessionId())
+        val screenName = firstPresent(options.screenName, runtime?.currentScreen())
+        val inForeground = options.inForeground ?: runtime?.inForeground
+        val installationIdHash = runtime?.installationIdHash()
+        putContext(context, "session_id", sessionId)
+        putContext(context, "screen_name", screenName)
+        putContext(context, "in_foreground", inForeground)
+        putContext(context, "installation_id_hash", installationIdHash)
+
+        val app = JSONObject()
+        putJson(app, "package_name", packageName)
+        putJson(app, "version_name", appVersion)
+        putJson(app, "version_code", buildNumber)
+        putJson(app, "build_type", buildType)
+        putJson(app, "screen", screenName)
+        putJson(app, "in_foreground", inForeground)
+        if (app.length() > 0) context["app"] = app
+
+        val session = JSONObject()
+        putJson(session, "id", sessionId)
+        if (session.length() > 0) context["session"] = session
+
+        val installation = JSONObject()
+        putJson(installation, "id_hash", installationIdHash)
+        if (installation.length() > 0) context["installation"] = installation
+
+        if (event.eventType == "error") {
+            val mechanism = options.mechanism ?: if (event.context.containsKey("exception")) "handled_exception" else event.context["error_mechanism"]?.toString()
+            val handled = options.handled ?: (mechanism == "handled_exception")
+            val error = JSONObject()
+            putJson(error, "mechanism", mechanism)
+            putJson(error, "handled", handled)
+            putJson(error, "user_perceived", if (mechanism in setOf("unhandled_exception", "anr", "native_crash")) inForeground else null)
+            if (error.length() > 0) context["error"] = error
+        }
+
+        val breadcrumbs = breadcrumbBuffer.snapshot()
+        if (breadcrumbs.isNotEmpty()) context["breadcrumbs"] = JSONArray(breadcrumbs)
+
         payload.put("context", JSONObject(context))
         return payload
     }
@@ -212,6 +300,7 @@ public class LogisterClient private constructor(
     private fun baseContext(): MutableMap<String, Any> {
         val context: MutableMap<String, Any> = LinkedHashMap()
         context["platform"] = "android"
+        context["telemetry_schema_version"] = 2
         putContext(context, "service", firstPresent(service, packageName))
         putContext(context, "package_name", packageName)
         putContext(context, "app_version", appVersion)
@@ -229,6 +318,18 @@ public class LogisterClient private constructor(
             putContext(context, "os_name", "Android")
             putContext(context, "os_version", Build.VERSION.RELEASE)
             context["android_api_level"] = Build.VERSION.SDK_INT
+
+            val device = JSONObject()
+            putJson(device, "manufacturer", Build.MANUFACTURER)
+            putJson(device, "model", Build.MODEL)
+            putJson(device, "brand", Build.BRAND)
+            context["device"] = device
+
+            val os = JSONObject()
+            putJson(os, "name", "Android")
+            putJson(os, "version", Build.VERSION.RELEASE)
+            putJson(os, "api_level", Build.VERSION.SDK_INT)
+            context["os"] = os
         }
 
         return context
@@ -255,6 +356,16 @@ public class LogisterClient private constructor(
         private var tokenRefreshSkewSeconds: Long = 60
         private var transport: LogisterTransport = HttpUrlConnectionLogisterTransport()
         private var executor: ExecutorService = Executors.newSingleThreadExecutor()
+        private var application: Application? = null
+        private var sessionTrackingEnabled: Boolean = false
+        private var installationTrackingEnabled: Boolean = false
+        private var installationRotationDays: Int = 90
+        private var automaticCrashCaptureEnabled: Boolean = false
+        private var applicationExitCaptureEnabled: Boolean = false
+        private var breadcrumbCapacity: Int = 0
+        private var offlineQueueEnabled: Boolean = false
+        private var offlineQueueMaxEvents: Int = 30
+        private var offlineQueueMaxBytes: Int = 512 * 1024
 
         public fun environment(environment: String?): Builder = apply {
             this.environment = environment
@@ -333,8 +444,60 @@ public class LogisterClient private constructor(
             }
         }
 
-        public fun build(): LogisterClient =
-            LogisterClient(
+        /** Supplies the app process needed for lifecycle, identity, exit, and disk-queue features. */
+        public fun application(application: Application?): Builder = apply {
+            this.application = application
+        }
+
+        public fun sessionTracking(enabled: Boolean): Builder = apply {
+            sessionTrackingEnabled = enabled
+        }
+
+        /** Enables a random, SHA-256 pseudonym that rotates on this device. No hardware ID is read. */
+        public fun installationTracking(enabled: Boolean, rotationDays: Int = 90): Builder = apply {
+            require(rotationDays in 1..365) { "rotationDays must be between 1 and 365" }
+            installationTrackingEnabled = enabled
+            installationRotationDays = rotationDays
+        }
+
+        public fun automaticCrashCapture(enabled: Boolean): Builder = apply {
+            automaticCrashCaptureEnabled = enabled
+        }
+
+        public fun applicationExitCapture(enabled: Boolean): Builder = apply {
+            applicationExitCaptureEnabled = enabled
+        }
+
+        public fun breadcrumbs(capacity: Int = 50): Builder = apply {
+            require(capacity in 0..100) { "breadcrumb capacity must be between 0 and 100" }
+            breadcrumbCapacity = capacity
+        }
+
+        public fun offlineQueue(enabled: Boolean, maxEvents: Int = 30, maxBytes: Int = 512 * 1024): Builder = apply {
+            require(maxEvents in 1..100) { "maxEvents must be between 1 and 100" }
+            require(maxBytes in 16 * 1024..2 * 1024 * 1024) { "maxBytes must be between 16 KiB and 2 MiB" }
+            offlineQueueEnabled = enabled
+            offlineQueueMaxEvents = maxEvents
+            offlineQueueMaxBytes = maxBytes
+        }
+
+        public fun build(): LogisterClient {
+            val needsApplication = sessionTrackingEnabled || installationTrackingEnabled || automaticCrashCaptureEnabled || applicationExitCaptureEnabled || offlineQueueEnabled
+            require(!needsApplication || application != null) { "application is required for enabled Android integrations" }
+
+            val effectiveDefaultContext = LinkedHashMap(defaultContext)
+            val sdk = JSONObject()
+            putJson(sdk, "name", "logister-android")
+            putJson(sdk, "version", "0.2.0")
+            putJson(sdk, "session_tracking", sessionTrackingEnabled)
+            putJson(sdk, "installation_tracking", installationTrackingEnabled)
+            putJson(sdk, "breadcrumbs_capacity", breadcrumbCapacity)
+            putJson(sdk, "automatic_crash_capture", automaticCrashCaptureEnabled)
+            putJson(sdk, "application_exit_capture", applicationExitCaptureEnabled)
+            putJson(sdk, "offline_queue", offlineQueueEnabled)
+            effectiveDefaultContext["sdk"] = sdk
+
+            val client = LogisterClient(
                 tokenProvider = tokenProvider,
                 endpoint = requireValue("endpoint", endpoint),
                 environment = environment,
@@ -347,14 +510,36 @@ public class LogisterClient private constructor(
                 appVersion = appVersion,
                 buildNumber = buildNumber,
                 buildType = buildType,
-                defaultContext = LinkedHashMap(defaultContext),
+                defaultContext = effectiveDefaultContext,
                 includeDeviceContext = includeDeviceContext,
                 connectTimeoutMs = connectTimeoutMs,
                 readTimeoutMs = readTimeoutMs,
                 tokenRefreshSkewSeconds = tokenRefreshSkewSeconds,
                 transport = transport,
-                executor = executor
+                executor = executor,
+                breadcrumbCapacity = breadcrumbCapacity
             )
+            val app = application
+            if (app != null) {
+                val runtimeIntegrationEnabled = sessionTrackingEnabled || installationTrackingEnabled || automaticCrashCaptureEnabled || applicationExitCaptureEnabled
+                if (runtimeIntegrationEnabled) {
+                    client.attachAndroidIntegration(
+                        LogisterAndroidIntegration(
+                            application = app,
+                            sessionTrackingEnabled = sessionTrackingEnabled,
+                            installationTrackingEnabled = installationTrackingEnabled,
+                            installationRotationDays = installationRotationDays,
+                            automaticCrashCaptureEnabled = automaticCrashCaptureEnabled,
+                            applicationExitCaptureEnabled = applicationExitCaptureEnabled
+                        )
+                    )
+                }
+                if (offlineQueueEnabled) {
+                    client.attachOfflineQueue(LogisterOfflineQueue(app, offlineQueueMaxEvents, offlineQueueMaxBytes))
+                }
+            }
+            return client
+        }
     }
 
     public companion object {
@@ -372,6 +557,10 @@ private fun putContext(context: MutableMap<String, Any>, key: String, value: Any
     if (value != null && !context.containsKey(key)) {
         context[key] = value
     }
+}
+
+private fun putJson(json: JSONObject, key: String, value: Any?) {
+    if (value != null) json.put(key, value)
 }
 
 private fun firstPresent(first: String?, second: String?): String? {

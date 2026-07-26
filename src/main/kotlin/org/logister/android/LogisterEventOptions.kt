@@ -16,6 +16,10 @@ public class LogisterEventOptions private constructor(builder: Builder) {
     public val userId: String? = builder.userId
     public val transactionName: String? = builder.transactionName
     public val durationMs: Double? = builder.durationMs
+    public val mechanism: String? = builder.mechanism
+    public val handled: Boolean? = builder.handled
+    public val inForeground: Boolean? = builder.inForeground
+    public val screenName: String? = builder.screenName
     public val context: Map<String, Any> = Collections.unmodifiableMap(LinkedHashMap(builder.context))
 
     public class Builder internal constructor() {
@@ -30,6 +34,10 @@ public class LogisterEventOptions private constructor(builder: Builder) {
         internal var userId: String? = null
         internal var transactionName: String? = null
         internal var durationMs: Double? = null
+        internal var mechanism: String? = null
+        internal var handled: Boolean? = null
+        internal var inForeground: Boolean? = null
+        internal var screenName: String? = null
         internal val context: MutableMap<String, Any> = LinkedHashMap()
 
         public fun level(level: String?): Builder = apply {
@@ -76,6 +84,23 @@ public class LogisterEventOptions private constructor(builder: Builder) {
             this.durationMs = durationMs
         }
 
+        /** Failure mechanism such as handled_exception, unhandled_exception, anr, or native_crash. */
+        public fun mechanism(mechanism: String?): Builder = apply {
+            this.mechanism = mechanism
+        }
+
+        public fun handled(handled: Boolean): Builder = apply {
+            this.handled = handled
+        }
+
+        public fun inForeground(inForeground: Boolean): Builder = apply {
+            this.inForeground = inForeground
+        }
+
+        public fun screenName(screenName: String?): Builder = apply {
+            this.screenName = screenName
+        }
+
         public fun context(key: String?, value: Any?): Builder = apply {
             if (!key.isNullOrEmpty() && value != null) {
                 context[key] = value
@@ -98,4 +123,3 @@ public class LogisterEventOptions private constructor(builder: Builder) {
         public fun builder(): Builder = Builder()
     }
 }
-
