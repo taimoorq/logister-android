@@ -6,8 +6,11 @@ import java.util.LinkedHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 import org.json.JSONArray
 import org.json.JSONObject
+
+internal const val LOGISTER_ANDROID_SDK_VERSION: String = "0.3.0"
 
 /** Main Android client for sending telemetry to Logister. */
 public class LogisterClient private constructor(
@@ -30,6 +33,8 @@ public class LogisterClient private constructor(
     private val tokenRefreshSkewSeconds: Long,
     private val transport: LogisterTransport,
     private val executor: ExecutorService,
+    private val exceptionDataPolicy: LogisterExceptionDataPolicy,
+    private val automaticCrashExceptionDataPolicy: LogisterExceptionDataPolicy,
     breadcrumbCapacity: Int
 ) {
     @Volatile
@@ -53,9 +58,7 @@ public class LogisterClient private constructor(
 
     @Throws(Exception::class)
     public fun capture(event: LogisterEvent, options: LogisterEventOptions?): LogisterResponse {
-        val envelope = JSONObject()
-        envelope.put("event", buildEventPayload(event, options ?: LogisterEventOptions.EMPTY))
-        return deliver(envelope)
+        return deliver(buildEnvelope(event, options ?: LogisterEventOptions.EMPTY))
     }
 
     public fun addBreadcrumb(breadcrumb: LogisterBreadcrumb) {
@@ -63,6 +66,29 @@ public class LogisterClient private constructor(
     }
 
     public fun queuedEventCount(): Int = offlineQueue?.size() ?: 0
+
+    public fun flushQueuedEventsAsync(): Future<Int> = executor.submit<Int> { flushQueuedEvents() }
+
+    @Throws(Exception::class)
+    public fun flushQueuedEvents(): Int {
+        val queue = offlineQueue ?: return 0
+        val token = mobileIngestToken()
+        return queue.flush { queuedEnvelope ->
+            try {
+                transport.send(endpoint, token, queuedEnvelope, connectTimeoutMs, readTimeoutMs).isAccepted
+            } catch (_: Exception) {
+                false
+            }
+        }
+    }
+
+    public fun clearQueuedEvents(): Boolean = offlineQueue?.clear() ?: true
+
+    /**
+     * Removes queued events containing a session or user identifier while retaining anonymous
+     * automatic crashes. Call this during logout or account replacement.
+     */
+    public fun clearSessionBoundQueuedEvents(): Int = offlineQueue?.removeIf(::isAccountBound) ?: 0
 
     internal fun attachAndroidIntegration(integration: LogisterAndroidIntegration?) {
         androidIntegration = integration
@@ -75,7 +101,12 @@ public class LogisterClient private constructor(
 
     @Throws(Exception::class)
     private fun deliver(envelope: JSONObject): LogisterResponse {
-        val token = mobileIngestToken()
+        val token = try {
+            mobileIngestToken()
+        } catch (error: Exception) {
+            if (offlineQueue?.enqueue(envelope) == true) return LogisterResponse.queued()
+            throw error
+        }
         offlineQueue?.flush { queuedEnvelope ->
             try {
                 transport.send(endpoint, token, queuedEnvelope, connectTimeoutMs, readTimeoutMs).isAccepted
@@ -126,11 +157,43 @@ public class LogisterClient private constructor(
         throwable: Throwable,
         options: LogisterEventOptions?
     ): Future<LogisterResponse> =
-        captureAsync(exceptionEvent(throwable), options)
+        captureAsync(exceptionEvent(throwable, exceptionDataPolicy, CAPTURE_SOURCE_MANUAL), options)
 
     @Throws(Exception::class)
     public fun captureException(throwable: Throwable, options: LogisterEventOptions? = null): LogisterResponse =
-        capture(exceptionEvent(throwable), options ?: LogisterEventOptions.EMPTY)
+        capture(
+            exceptionEvent(throwable, exceptionDataPolicy, CAPTURE_SOURCE_MANUAL),
+            options ?: LogisterEventOptions.EMPTY,
+        )
+
+    internal fun captureUncaughtException(throwable: Throwable) {
+        val event = exceptionEvent(
+            throwable = throwable,
+            policy = automaticCrashExceptionDataPolicy,
+            captureSource = CAPTURE_SOURCE_AUTOMATIC,
+        )
+        val options = LogisterEventOptions.builder()
+            .mechanism("unhandled_exception")
+            .handled(false)
+            .build()
+        val envelope = buildEnvelope(event, options)
+        if (offlineQueue?.enqueue(envelope) == true) {
+            executor.submit {
+                try {
+                    flushQueuedEvents()
+                } catch (_: Exception) {
+                    // The durable envelope remains queued for a later authenticated flush.
+                }
+            }
+            return
+        }
+
+        try {
+            captureAsync(event, options).get(CRASH_DELIVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        } catch (_: Exception) {
+            // The existing uncaught-exception handler must always continue.
+        }
+    }
 
     public fun captureMessageAsync(message: String): Future<LogisterResponse> =
         captureMessageAsync(message, LogisterEventOptions.EMPTY)
@@ -268,6 +331,8 @@ public class LogisterClient private constructor(
             putJson(error, "mechanism", mechanism)
             putJson(error, "handled", handled)
             putJson(error, "user_perceived", if (mechanism in setOf("unhandled_exception", "anr", "native_crash")) inForeground else null)
+            putJson(error, "capture_source", event.context[CAPTURE_SOURCE_CONTEXT_KEY])
+            putJson(error, "data_policy", event.context[EXCEPTION_DATA_POLICY_CONTEXT_KEY])
             if (error.length() > 0) context["error"] = error
         }
 
@@ -278,21 +343,34 @@ public class LogisterClient private constructor(
         return payload
     }
 
-    private fun exceptionEvent(throwable: Throwable): LogisterEvent {
+    private fun buildEnvelope(
+        event: LogisterEvent,
+        options: LogisterEventOptions,
+    ): JSONObject = JSONObject().put("event", buildEventPayload(event, options))
+
+    private fun exceptionEvent(
+        throwable: Throwable,
+        policy: LogisterExceptionDataPolicy,
+        captureSource: String,
+    ): LogisterEvent {
         var message = throwable.javaClass.name
-        if (!throwable.message.isNullOrEmpty()) {
+        if (policy == LogisterExceptionDataPolicy.FULL && !throwable.message.isNullOrEmpty()) {
             message += ": ${throwable.message}"
         }
 
         return try {
             LogisterEvent.builder("error", message)
                 .level("error")
-                .context("exception", LogisterExceptionSerializer.serialize(throwable))
+                .context("exception", LogisterExceptionSerializer.serialize(throwable, policy))
+                .context(CAPTURE_SOURCE_CONTEXT_KEY, captureSource)
+                .context(EXCEPTION_DATA_POLICY_CONTEXT_KEY, policy.wireValue)
                 .build()
         } catch (_: Exception) {
             LogisterEvent.builder("error", message)
                 .level("error")
                 .context("exception_class", throwable.javaClass.name)
+                .context(CAPTURE_SOURCE_CONTEXT_KEY, captureSource)
+                .context(EXCEPTION_DATA_POLICY_CONTEXT_KEY, policy.wireValue)
                 .build()
         }
     }
@@ -335,6 +413,15 @@ public class LogisterClient private constructor(
         return context
     }
 
+    private fun isAccountBound(envelope: JSONObject): Boolean {
+        val event = envelope.optJSONObject("event") ?: return false
+        if (event.hasAccountIdentifier()) return true
+        val context = event.optJSONObject("context") ?: return false
+        if (context.hasAccountIdentifier()) return true
+        if (context.optJSONObject("session")?.has("id") == true) return true
+        return context.optJSONObject("user")?.has("id") == true
+    }
+
     public class Builder internal constructor(
         private val tokenProvider: LogisterTokenProvider,
         private val endpoint: String
@@ -366,6 +453,10 @@ public class LogisterClient private constructor(
         private var offlineQueueEnabled: Boolean = false
         private var offlineQueueMaxEvents: Int = 30
         private var offlineQueueMaxBytes: Int = 512 * 1024
+        private var offlineQueueMaxAgeDays: Int = 7
+        private var exceptionDataPolicy: LogisterExceptionDataPolicy = LogisterExceptionDataPolicy.FULL
+        private var automaticCrashExceptionDataPolicy: LogisterExceptionDataPolicy =
+            LogisterExceptionDataPolicy.TYPE_AND_STACKTRACE
 
         public fun environment(environment: String?): Builder = apply {
             this.environment = environment
@@ -460,8 +551,18 @@ public class LogisterClient private constructor(
             installationRotationDays = rotationDays
         }
 
-        public fun automaticCrashCapture(enabled: Boolean): Builder = apply {
+        @JvmOverloads
+        public fun automaticCrashCapture(
+            enabled: Boolean,
+            exceptionDataPolicy: LogisterExceptionDataPolicy = LogisterExceptionDataPolicy.TYPE_AND_STACKTRACE,
+        ): Builder = apply {
             automaticCrashCaptureEnabled = enabled
+            automaticCrashExceptionDataPolicy = exceptionDataPolicy
+        }
+
+        /** Sets the policy used by manual captureException calls. */
+        public fun exceptionDataPolicy(exceptionDataPolicy: LogisterExceptionDataPolicy): Builder = apply {
+            this.exceptionDataPolicy = exceptionDataPolicy
         }
 
         public fun applicationExitCapture(enabled: Boolean): Builder = apply {
@@ -473,28 +574,53 @@ public class LogisterClient private constructor(
             breadcrumbCapacity = capacity
         }
 
-        public fun offlineQueue(enabled: Boolean, maxEvents: Int = 30, maxBytes: Int = 512 * 1024): Builder = apply {
+        /**
+         * Enables the durable queue with its default seven-day retention period.
+         *
+         * Keep this three-argument/defaulted overload binary-compatible with 0.2.x Kotlin callers.
+         */
+        public fun offlineQueue(
+            enabled: Boolean,
+            maxEvents: Int = 30,
+            maxBytes: Int = 512 * 1024,
+        ): Builder = offlineQueue(enabled, maxEvents, maxBytes, maxAgeDays = 7)
+
+        /** Enables the durable queue with an explicit retention period. */
+        public fun offlineQueue(
+            enabled: Boolean,
+            maxEvents: Int,
+            maxBytes: Int,
+            maxAgeDays: Int,
+        ): Builder = apply {
             require(maxEvents in 1..100) { "maxEvents must be between 1 and 100" }
             require(maxBytes in 16 * 1024..2 * 1024 * 1024) { "maxBytes must be between 16 KiB and 2 MiB" }
+            require(maxAgeDays in 1..30) { "maxAgeDays must be between 1 and 30" }
             offlineQueueEnabled = enabled
             offlineQueueMaxEvents = maxEvents
             offlineQueueMaxBytes = maxBytes
+            offlineQueueMaxAgeDays = maxAgeDays
         }
 
         public fun build(): LogisterClient {
             val needsApplication = sessionTrackingEnabled || installationTrackingEnabled || automaticCrashCaptureEnabled || applicationExitCaptureEnabled || offlineQueueEnabled
             require(!needsApplication || application != null) { "application is required for enabled Android integrations" }
+            require(!(automaticCrashCaptureEnabled || applicationExitCaptureEnabled) || offlineQueueEnabled) {
+                "automatic crash and application-exit capture require the durable offline queue"
+            }
 
             val effectiveDefaultContext = LinkedHashMap(defaultContext)
             val sdk = JSONObject()
             putJson(sdk, "name", "logister-android")
-            putJson(sdk, "version", "0.2.0")
+            putJson(sdk, "version", LOGISTER_ANDROID_SDK_VERSION)
             putJson(sdk, "session_tracking", sessionTrackingEnabled)
             putJson(sdk, "installation_tracking", installationTrackingEnabled)
             putJson(sdk, "breadcrumbs_capacity", breadcrumbCapacity)
             putJson(sdk, "automatic_crash_capture", automaticCrashCaptureEnabled)
+            putJson(sdk, "automatic_crash_data_policy", automaticCrashExceptionDataPolicy.wireValue)
+            putJson(sdk, "manual_exception_data_policy", exceptionDataPolicy.wireValue)
             putJson(sdk, "application_exit_capture", applicationExitCaptureEnabled)
             putJson(sdk, "offline_queue", offlineQueueEnabled)
+            putJson(sdk, "offline_queue_max_age_days", offlineQueueMaxAgeDays)
             effectiveDefaultContext["sdk"] = sdk
 
             val client = LogisterClient(
@@ -517,10 +643,22 @@ public class LogisterClient private constructor(
                 tokenRefreshSkewSeconds = tokenRefreshSkewSeconds,
                 transport = transport,
                 executor = executor,
+                exceptionDataPolicy = exceptionDataPolicy,
+                automaticCrashExceptionDataPolicy = automaticCrashExceptionDataPolicy,
                 breadcrumbCapacity = breadcrumbCapacity
             )
             val app = application
             if (app != null) {
+                if (offlineQueueEnabled) {
+                    client.attachOfflineQueue(
+                        LogisterOfflineQueue(
+                            context = app,
+                            maxEvents = offlineQueueMaxEvents,
+                            maxBytes = offlineQueueMaxBytes,
+                            maxAgeDays = offlineQueueMaxAgeDays,
+                        ),
+                    )
+                }
                 val runtimeIntegrationEnabled = sessionTrackingEnabled || installationTrackingEnabled || automaticCrashCaptureEnabled || applicationExitCaptureEnabled
                 if (runtimeIntegrationEnabled) {
                     client.attachAndroidIntegration(
@@ -534,15 +672,18 @@ public class LogisterClient private constructor(
                         )
                     )
                 }
-                if (offlineQueueEnabled) {
-                    client.attachOfflineQueue(LogisterOfflineQueue(app, offlineQueueMaxEvents, offlineQueueMaxBytes))
-                }
             }
             return client
         }
     }
 
     public companion object {
+        private const val CAPTURE_SOURCE_CONTEXT_KEY = "capture_source"
+        private const val EXCEPTION_DATA_POLICY_CONTEXT_KEY = "exception_data_policy"
+        private const val CAPTURE_SOURCE_MANUAL = "manual"
+        private const val CAPTURE_SOURCE_AUTOMATIC = "automatic"
+        private const val CRASH_DELIVERY_TIMEOUT_SECONDS = 2L
+
         @JvmStatic
         public fun builder(tokenProvider: LogisterTokenProvider, baseUrl: String): Builder =
             Builder(tokenProvider, endpointFromBaseUrl(baseUrl))
@@ -552,6 +693,8 @@ public class LogisterClient private constructor(
             Builder(tokenProvider, endpoint)
     }
 }
+
+private fun JSONObject.hasAccountIdentifier(): Boolean = has("session_id") || has("user_id")
 
 private fun putContext(context: MutableMap<String, Any>, key: String, value: Any?) {
     if (value != null && !context.containsKey(key)) {

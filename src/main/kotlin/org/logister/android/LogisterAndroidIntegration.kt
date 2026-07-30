@@ -7,6 +7,7 @@ import android.app.Application
 import android.app.ApplicationExitInfo
 import android.os.Build
 import android.os.Bundle
+import android.os.Process
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -14,6 +15,7 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import kotlin.system.exitProcess
 
 internal class LogisterAndroidIntegration(
     private val application: Application,
@@ -85,21 +87,16 @@ internal class LogisterAndroidIntegration(
 
     private fun installExceptionHandler() {
         previousHandler = Thread.getDefaultUncaughtExceptionHandler()
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            try {
-                client?.captureExceptionAsync(
-                    throwable,
-                    LogisterEventOptions.builder()
-                        .mechanism("unhandled_exception")
-                        .handled(false)
-                        .build()
-                )?.get(2, TimeUnit.SECONDS)
-            } catch (_: Exception) {
-                // The previous handler must still run even when telemetry cannot be delivered.
-            } finally {
-                previousHandler?.uncaughtException(thread, throwable)
-            }
+        val delegate = previousHandler ?: Thread.UncaughtExceptionHandler { _, _ ->
+            Process.killProcess(Process.myPid())
+            exitProcess(FALLBACK_EXIT_CODE)
         }
+        Thread.setDefaultUncaughtExceptionHandler(
+            LogisterUncaughtExceptionHandler(
+                capture = { throwable -> client?.captureUncaughtException(throwable) },
+                delegate = delegate,
+            ),
+        )
     }
 
     @TargetApi(Build.VERSION_CODES.R)
@@ -112,12 +109,16 @@ internal class LogisterAndroidIntegration(
             .sortedBy { it.timestamp }
         exits.forEach { exit ->
             val mechanism = mechanismFor(exit.reason) ?: return@forEach
-            val description = exit.description ?: "Android process exit"
-            val event = LogisterEvent.builder("error", description)
+            if (automaticCrashCaptureEnabled && exit.reason == ApplicationExitInfo.REASON_CRASH) {
+                return@forEach
+            }
+            val event = LogisterEvent.builder("error", "Android process exit: $mechanism")
                 .level(if (mechanism == "low_memory_kill") "warning" else "error")
                 .occurredAt(iso8601(exit.timestamp))
                 .context("error_mechanism", mechanism)
                 .context("handled", false)
+                .context("capture_source", "historical_exit")
+                .context("exception_data_policy", "metadata_only")
                 .context("application_exit_reason", exit.reason)
                 .context("application_exit_importance", exit.importance)
                 .build()
@@ -146,5 +147,6 @@ internal class LogisterAndroidIntegration(
 
     private companion object {
         val SESSION_TIMEOUT_MILLIS: Long = TimeUnit.MINUTES.toMillis(30)
+        const val FALLBACK_EXIT_CODE: Int = 10
     }
 }

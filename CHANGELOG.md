@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.0 - 2026-07-29
+
+- Made automatic uncaught-exception capture privacy-safe by default: it records the exception type and bounded stack frames while omitting raw messages and cause chains.
+- Persisted automatic crashes synchronously before delegating to Android's existing uncaught-exception handler, including when a mobile ingest token cannot yet be minted.
+- Added bounded queue expiration, explicit flush/clear APIs, and account-bound cleanup that removes queued session- or user-identified events while retaining anonymous automatic crashes.
+- Added capture-source and exception-data-policy metadata, removed raw Android app-exit descriptions, and avoided duplicate historical Java-crash events.
+- Added an explicit full-detail policy for apps that intentionally opt into exception messages and causes; manual capture remains full-detail by default for compatibility.
+
 ## v0.2.0 - 2026-07-26
 
 - Added the versioned Android telemetry contract with canonical app, device, OS, session, installation, lifecycle, and error-mechanism fields while retaining the existing flat aliases.
