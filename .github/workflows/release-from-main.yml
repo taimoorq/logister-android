@@ -10,7 +10,6 @@ on:
       - completed
 
 permissions:
-  actions: write
   contents: write
 
 concurrency:
@@ -64,13 +63,15 @@ jobs:
             git fetch origin "refs/tags/${{ steps.version.outputs.tag }}:refs/tags/${{ steps.version.outputs.tag }}"
             tagged_sha="$(git rev-list -n 1 "${{ steps.version.outputs.tag }}")"
 
-            if gh release view "${{ steps.version.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if [ "$tagged_sha" != "${{ github.event.workflow_run.head_sha }}" ] && ! git diff --quiet "$tagged_sha" "${{ github.event.workflow_run.head_sha }}" -- src/main README.md build.gradle.kts; then
+              echo "::error::Publishable files changed since ${{ steps.version.outputs.tag }}. Bump VERSION_NAME and the SDK version and add changelog notes."
+              exit 1
+            elif [ "$tagged_sha" != "${{ github.event.workflow_run.head_sha }}" ]; then
+              echo "::notice::Only tooling or test files changed since ${{ steps.version.outputs.tag }}; no release is needed."
+            elif gh release view "${{ steps.version.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
               echo "::notice::${{ steps.version.outputs.tag }} already has a GitHub release; no new release is needed."
             elif curl --fail --silent --head --location "https://repo1.maven.org/maven2/org/logister/logister-android/${{ steps.version.outputs.version }}/logister-android-${{ steps.version.outputs.version }}.pom" >/dev/null; then
               echo "::notice::${{ steps.version.outputs.tag }} is already on Maven Central; no new package can be published for this version."
-            elif [ "$tagged_sha" != "${{ github.event.workflow_run.head_sha }}" ]; then
-              echo "::error::${{ steps.version.outputs.tag }} already points to $tagged_sha, not the verified main commit ${{ github.event.workflow_run.head_sha }}. Bump VERSION_NAME instead of moving an existing release tag."
-              exit 1
             else
               echo "::warning::${{ steps.version.outputs.tag }} exists on this commit without a published release. Re-run the Release workflow from this tag after confirming Maven Central did not accept the version."
             fi
@@ -82,22 +83,8 @@ jobs:
 
       - name: Create release tag and dispatch release
         if: steps.main.outputs.current == 'true' && steps.tag.outputs.exists != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${{ steps.version.outputs.tag }}" -m "Release logister-android ${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
-
-          for attempt in 1 2 3; do
-            if gh workflow run release.yml --ref "${{ steps.version.outputs.tag }}" -f version="${{ steps.version.outputs.version }}"; then
-              exit 0
-            fi
-
-            echo "::warning::Release dispatch attempt $attempt failed."
-            sleep 5
-          done
-
-          echo "::error::The tag was created, but the Release workflow could not be dispatched. Re-run Release from ${{ steps.version.outputs.tag }}."
-          exit 1

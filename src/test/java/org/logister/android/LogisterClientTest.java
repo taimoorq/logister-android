@@ -5,8 +5,12 @@ import org.junit.Test;
 
 import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
@@ -32,6 +36,7 @@ public final class LogisterClientTest {
                 "count",
                 LogisterEventOptions.builder()
                         .sessionId("session-123")
+                        .sessionStartedAt("2026-08-09T12:00:00.000Z")
                         .context("screen_name", "Checkout")
                         .build()
         ).get();
@@ -53,6 +58,7 @@ public final class LogisterClientTest {
         assertEquals("abc1234", context.getString("commit_sha"));
         assertEquals("main", context.getString("branch"));
         assertEquals("session-123", context.getString("session_id"));
+        assertEquals("2026-08-09T12:00:00.000Z", context.getJSONObject("session").getString("started_at"));
         assertEquals("Checkout", context.getString("screen_name"));
         assertEquals(3.0, context.getDouble("value"), 0.001);
         assertEquals("count", context.getString("unit"));
@@ -134,7 +140,16 @@ public final class LogisterClientTest {
         ).get();
 
         JSONObject context = transport.envelope.getJSONObject("event").getJSONObject("context");
-        assertEquals(2, context.getInt("telemetry_schema_version"));
+        JSONObject event = transport.envelope.getJSONObject("event");
+        JSONObject evidence = event.getJSONObject("evidence");
+        assertEquals(3, context.getInt("telemetry_schema_version"));
+        assertNotNull(event.getString("uuid"));
+        assertNotNull(event.getString("occurred_at"));
+        assertEquals("sdk", evidence.getString("source"));
+        assertEquals("unhandled_exception", evidence.getString("kind"));
+        assertEquals("reported_stack", evidence.getString("evidence_kind"));
+        assertEquals("occurrence", evidence.getString("identity_scope"));
+        assertTrue(!evidence.has("occurred_at"));
         assertEquals("com.acme.shop", context.getJSONObject("app").getString("package_name"));
         assertEquals("2.0.0", context.getJSONObject("app").getString("version_name"));
         assertEquals("50", context.getJSONObject("app").getString("version_code"));
@@ -157,6 +172,46 @@ public final class LogisterClientTest {
         } catch (IllegalArgumentException exception) {
             assertTrue(exception.getMessage().contains("application is required"));
         }
+    }
+
+    @Test
+    public void captureAsyncSnapshotsIdentityTimeAndBreadcrumbsBeforeExecutorDelivery() throws Exception {
+        CapturingTransport transport = new CapturingTransport();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        CountDownLatch executorStarted = new CountDownLatch(1);
+        CountDownLatch releaseExecutor = new CountDownLatch(1);
+        executor.submit(() -> {
+            executorStarted.countDown();
+            releaseExecutor.await();
+            return null;
+        });
+        assertTrue(executorStarted.await(1, TimeUnit.SECONDS));
+
+        LogisterClient client = LogisterClient.builder(
+                        new SequenceTokenProvider(new LogisterToken("mobile-token-1", nowEpochSeconds() + 300)),
+                        "https://logister.example"
+                )
+                .includeDeviceContext(false)
+                .breadcrumbs(10)
+                .transport(transport)
+                .executor(executor)
+                .build();
+        client.addBreadcrumb(LogisterBreadcrumb.builder("before capture").build());
+
+        Future<LogisterResponse> capture = client.captureMessageAsync("snapshot me");
+        client.addBreadcrumb(LogisterBreadcrumb.builder("after capture").build());
+        releaseExecutor.countDown();
+        assertTrue(capture.get(2, TimeUnit.SECONDS).isAccepted());
+
+        JSONObject event = transport.envelope.getJSONObject("event");
+        assertNotNull(event.getString("uuid"));
+        assertNotNull(event.getString("occurred_at"));
+        assertEquals(1, event.getJSONObject("context").getJSONArray("breadcrumbs").length());
+        assertEquals(
+                "before capture",
+                event.getJSONObject("context").getJSONArray("breadcrumbs").getJSONObject(0).getString("message")
+        );
+        executor.shutdownNow();
     }
 
     @Test

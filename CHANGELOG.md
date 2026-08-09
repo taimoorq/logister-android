@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.5.0 - 2026-08-09
+
+- Added bounded, structured Android 11+ ANR thread evidence from `ApplicationExitInfo.traceInputStream` without persisting the raw trace text, lock annotations, process command line, or other arbitrary lines.
+- Added canonical byte measurements for the last system-sampled PSS and RSS, explicit exit status, typed diagnostic source/kind/evidence metadata, and truthful last-sample precision.
+- Added the bounded actual crashing-thread name alongside the existing `crashed` role for live uncaught exceptions; reporting and sampled threads remain distinct.
+- Kept historical capture off the main thread, retained the 0.4 process-run provenance and tenant-safe queue guarantees, and preserved the original grouping identity when server-side R8 enrichment arrives.
+
+## v0.4.0 - 2026-08-09
+
+- Added telemetry schema v3 with a UUID, exact UTC capture time, source/kind/capture/evidence facets, and an immutable context snapshot created before asynchronous delivery.
+- Made Android 11+ historical exits durable before checkpointing and source-faithful across relaunches by using a bounded no-backup process-run journal; prior build facts are retained when proven and reported as unknown otherwise.
+- Replaced the unscoped Auto Backup-eligible queue and installation state with endpoint/app/client-scoped no-backup storage. Ambiguous 0.3 state is discarded and reported locally rather than adopted under an unproved tenant.
+- Added bounded retry backoff, `Retry-After`, one-time `401` refresh, poison-response discard, crash-lock deadlines, process policy, hook detachment, scoped consent purge, and non-sensitive client health.
+- Added recursive sensitive-key and Bearer/URL scrubbing, payload depth/item/string/byte limits, and a final synchronous `beforeSend` hook that cannot replace event identity, time, or evidence provenance.
+- Added automatic package/version/build/release, process, ABI, crash/reporting thread role, and fatality context while preserving existing builder and v2 alias compatibility.
+
 ## v0.3.0 - 2026-07-29
 
 - Made automatic uncaught-exception capture privacy-safe by default: it records the exception type and bounded stack frames while omitting raw messages and cause chains.

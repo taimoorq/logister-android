@@ -30,6 +30,7 @@ class LogisterKotlinTest {
 
         val response = client.captureMetricAsync("cart.item_count", 3, "count") {
             sessionId("session-123")
+            sessionStartedAt("2026-08-09T12:00:00.000Z")
             context("screen_name", "Checkout")
         }.get()
 
@@ -51,6 +52,7 @@ class LogisterKotlinTest {
         assertEquals("abc1234", context.getString("commit_sha"))
         assertEquals("main", context.getString("branch"))
         assertEquals("session-123", context.getString("session_id"))
+        assertEquals("2026-08-09T12:00:00.000Z", context.getJSONObject("session").getString("started_at"))
         assertEquals("Checkout", context.getString("screen_name"))
         assertEquals(3.0, context.getDouble("value"), 0.001)
         assertEquals("count", context.getString("unit"))
@@ -133,6 +135,32 @@ class LogisterKotlinTest {
 
         assertEquals(2, tokenProvider.fetchCount)
         assertEquals(listOf("mobile-token-1", "mobile-token-2"), transport.mobileIngestTokens)
+    }
+
+    @Test
+    fun unauthorizedResponseRefreshesAuthenticationExactlyOnce() {
+        val tokenProvider = SequenceTokenProvider(
+            LogisterToken("mobile-token-1", futureEpochSeconds()),
+            LogisterToken("mobile-token-2", futureEpochSeconds()),
+        )
+        val statuses = ArrayDeque(listOf(401, 202))
+        val tokens = mutableListOf<String>()
+        val transport = LogisterTransport { _, token, _, _, _ ->
+            tokens += token
+            LogisterResponse(statuses.removeFirst())
+        }
+        val client = logisterClient(
+            baseUrl = "https://logister.example",
+            tokenProvider = tokenProvider,
+        ) {
+            includeDeviceContext(false)
+            transport(transport)
+            executor(Executors.newSingleThreadExecutor())
+        }
+
+        assertTrue(client.captureMessageAsync("refresh me").get().isAccepted)
+        assertEquals(2, tokenProvider.fetchCount)
+        assertEquals(listOf("mobile-token-1", "mobile-token-2"), tokens)
     }
 
     @Test

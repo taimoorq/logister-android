@@ -40,4 +40,9 @@ if ! grep -Fq "org.logister:logister-android:$checked_in_version" README.md; the
   exit 1
 fi
 
+if ! grep -Fq "LOGISTER_ANDROID_SDK_VERSION: String = \"$checked_in_version\"" src/main/kotlin/org/logister/android/LogisterClient.kt; then
+  echo "LogisterClient SDK version does not match VERSION_NAME $checked_in_version." >&2
+  exit 1
+fi
+
 echo "Release metadata is consistent for v$checked_in_version."

@@ -6,6 +6,9 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 import org.json.JSONObject
 
 /** Default transport backed by HttpURLConnection to avoid extra runtime dependencies. */
@@ -34,10 +37,11 @@ public class HttpUrlConnectionLogisterTransport : LogisterTransport {
         }
 
         val statusCode = connection.responseCode
+        val retryAfterMillis = parseRetryAfter(connection.getHeaderField("Retry-After"))
         val responseStream = if (statusCode >= 400) connection.errorStream else connection.inputStream
         val body = readBody(responseStream)
         connection.disconnect()
-        return LogisterResponse(statusCode, body)
+        return LogisterResponse.withRetryAfter(statusCode, body, retryAfterMillis)
     }
 
     @Throws(Exception::class)
@@ -55,5 +59,25 @@ public class HttpUrlConnectionLogisterTransport : LogisterTransport {
             }
         }
         return body.toString()
+    }
+
+    private fun parseRetryAfter(value: String?): Long? {
+        if (value.isNullOrBlank()) return null
+        value.trim().toLongOrNull()?.let { seconds ->
+            return (seconds.coerceAtLeast(0) * 1_000).coerceAtMost(MAX_RETRY_AFTER_MILLIS)
+        }
+        val parsed = try {
+            SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone("GMT")
+                isLenient = false
+            }.parse(value)?.time
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        return (parsed - System.currentTimeMillis()).coerceIn(0, MAX_RETRY_AFTER_MILLIS)
+    }
+
+    private companion object {
+        const val MAX_RETRY_AFTER_MILLIS: Long = 24 * 60 * 60 * 1_000
     }
 }

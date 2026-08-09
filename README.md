@@ -23,7 +23,7 @@ Android app → Logister ingest endpoint with the short-lived token
 - Injectable transport for tests or alternate networking stacks.
 - Token-provider based authentication with short-lived mobile ingest tokens.
 - Async client methods for errors, logs, metrics, transactions, spans, and check-ins.
-- Versioned canonical app, release, Android OS/API, device, lifecycle, and failure-mechanism context while retaining the original flat field aliases.
+- Telemetry schema v3 with immutable event identity/time plus canonical app, release, Android OS/API, device, process, lifecycle, source, and failure evidence while retaining the original flat field aliases.
 - Opt-in lifecycle sessions, rotating random installation pseudonyms, bounded breadcrumbs, uncaught-exception capture, Android 11+ historical exit/ANR capture, and a bounded disk retry queue.
 
 Automatic collection is disabled until you provide an `Application` and enable each capability. Network spans remain manual.
@@ -34,7 +34,7 @@ Install the Android SDK from Maven Central:
 
 ```kotlin
 dependencies {
-    implementation("org.logister:logister-android:0.3.0")
+    implementation("org.logister:logister-android:0.5.0")
 }
 ```
 
@@ -119,6 +119,8 @@ val client = logisterClient(
     buildNumber(BuildConfig.VERSION_CODE.toString())
     buildType(BuildConfig.BUILD_TYPE)
     application(myApplication)
+    // Required when one app configures multiple logical Logister clients.
+    storageNamespace("primary-mobile-project")
     exceptionDataPolicy(LogisterExceptionDataPolicy.TYPE_AND_STACKTRACE)
     sessionTracking(true)
     installationTracking(true, rotationDays = 90)
@@ -159,16 +161,48 @@ try {
 
 The installation pseudonym is generated randomly, SHA-256 encoded, and rotated on the configured schedule. The SDK does not read Android ID, advertising ID, IMEI, or a hardware serial. Keep installation tracking, session tracking, breadcrumbs, and automatic handlers aligned with your consent and privacy policy.
 
-Automatic crash capture uses `TYPE_AND_STACKTRACE` by default. It omits throwable messages and cause chains, persists the envelope before Android's previous uncaught-exception handler runs, and requires the durable offline queue. Manual `captureException` calls retain the 0.2.x full-detail policy unless the app sets `exceptionDataPolicy(TYPE_AND_STACKTRACE)` as shown above.
+Collection is enabled by default for compatibility. Call `setCollectionEnabled(false)` when consent is withdrawn; by default it purges this client's queue, breadcrumbs, session, installation pseudonym, exit checkpoint, and process-run journal. `setCollectionEnabled(true)` creates fresh runtime identity. `healthSnapshot()` returns only bounded local capability, consent, queue/drop, delivery/error, process-policy, and crash-handler state. Call `close()` to unregister lifecycle callbacks and restore the prior uncaught-exception handler.
 
-The offline queue stores at most the configured event and byte limits in app-private preferences and expires old entries after `maxAgeDays`. Token-provider failures are queued, so a sanitized crash can be sent after a later authenticated launch. A queued response has `isQueued == true` and `isAccepted == false`; it only becomes accepted after a later server response succeeds. Call `flushQueuedEventsAsync()` after authentication when the app may not immediately emit another event. Call `clearSessionBoundQueuedEvents()` on logout or account replacement; it removes events containing either `session_id` or `user_id` while retaining anonymous automatic crashes. `clearQueuedEvents()` removes everything.
+The default `MAIN_ONLY` process policy initializes automatic behavior only in the app's main process. Use `processPolicy(LogisterProcessPolicy.CURRENT_PROCESS)` for an explicitly configured process-local client, or `ALLOWLIST` with `allowedProcesses(...)`; non-main scopes include the process name in their storage key.
 
-Android 11+ historical exit capture records only the reason, importance, timestamp, and stable mechanism. Raw `ApplicationExitInfo.description` text is never included. When automatic crash capture is enabled, ordinary Java crash exits are not reported again through historical exit capture.
+Every payload is recursively scrubbed for common credential keys, Bearer values, and URL query/fragment data and is subject to bounded depth, item, string, and byte limits. Customize deterministic limits and keys with `payloadPolicy(...)`. A synchronous `beforeSend(...)` hook may further redact or discard an envelope, but it should never perform network or disk I/O and cannot replace the SDK-owned UUID, occurrence time, or evidence provenance.
+
+Automatic crash capture uses `TYPE_AND_STACKTRACE` by default. It omits throwable messages and cause chains, records the bounded actual crashing-thread name with the `crashed` role, persists the envelope before Android's previous uncaught-exception handler runs, and requires the durable offline queue. Manual `captureException` calls retain the 0.2.x full-detail policy unless the app sets `exceptionDataPolicy(TYPE_AND_STACKTRACE)` as shown above.
+
+The offline queue stores at most the configured event and byte limits in an atomic app-private file under `noBackupFilesDir` and expires old entries after `maxAgeDays`. It is scoped by endpoint, application/service, optional `storageNamespace`, and process policy; tokens are never stored. Token-provider failures and retryable `408`, `425`, `429`, and `5xx` responses are queued with bounded backoff and `Retry-After`; a permanent client rejection is discarded so it cannot block later events. A queued response has `isQueued == true` and `isAccepted == false`; it only becomes accepted after a later server response succeeds. Call `flushQueuedEventsAsync()` after authentication when the app may not immediately emit another event. Call `clearSessionBoundQueuedEvents()` on logout or account replacement; it removes events containing either `session_id` or `user_id` while retaining anonymous automatic crashes. `clearQueuedEvents()` removes everything. Because the 0.3 queue and installation pseudonym had no provable client owner, 0.4 discards that ambiguous legacy state instead of risking cross-project delivery.
+
+Android 11+ historical exit capture records the reason, importance, status, process, exact timestamp, stable source identity, stable mechanism, and available last-sampled PSS/RSS values. For ANRs, 0.5 can add a bounded structured Java/Kotlin thread dump from `ApplicationExitInfo.traceInputStream`; it retains only thread names and parsed stack-frame fields and never stores the raw trace, command line, lock annotations, or arbitrary lines. PSS/RSS are labeled as system samples, not exact memory at termination. A bounded no-backup run journal attributes the prior package/version/build/environment/release when the SDK can prove it; otherwise the build is explicitly unknown and never copied from the relaunch. Current session, screen, foreground, device, installation, and breadcrumbs are never attached to a prior-process exit. Raw `ApplicationExitInfo.description` text is never included. When automatic crash capture is enabled, ordinary Java crash exits are not reported again through historical exit capture.
 
 When the Logister project is connected to a GitHub repository, `repository`,
 `commitSha`, and `branch` help source-aware error details resolve frames to the
 right code. CI/CD systems should record release-to-commit deployment mappings
 with the Logister HTTP API `POST /api/v1/deployments` endpoint.
+
+## R8 mapping upload in CI
+
+Keep build artifacts out of the runtime SDK. After the release variant has
+produced its exact `mapping.txt`, upload it from the trusted build environment
+with the Logister CLI:
+
+```bash
+./gradlew :app:assembleRelease
+
+LOGISTER_HOST=https://logister.example.com \
+LOGISTER_TOKEN="$LOGISTER_ARTIFACT_TOKEN" \
+logister artifacts upload-android \
+  --project "$LOGISTER_PROJECT" \
+  --file app/build/outputs/mapping/release/mapping.txt \
+  --package-name com.acme.shop \
+  --version-name "$VERSION_NAME" \
+  --version-code "$VERSION_CODE"
+```
+
+Use an expiring, project-limited CLI token approved with the additive
+`artifacts:write` scope. Do not reuse the app's mobile ingest token or compile
+the CI token into the APK. Upload every shipped minified variant after its
+mapping exists; Logister keys coverage to the package and version code and
+stores the artifact checksum. The manual upload in the project's **Artifacts**
+page remains a recovery path.
 
 ## Spans And Check-ins
 
@@ -255,10 +289,10 @@ curl -fsSI https://repo1.maven.org/maven2/org/logister/logister-android/X.Y.Z/lo
 gh release view vX.Y.Z
 ```
 
-For `0.3.0`, commit the SDK changes with `VERSION_NAME=0.3.0`, its `CHANGELOG.md` section, and the matching README dependency example, then push or merge that commit to `main`. No manual tag is needed. Follow the `CI`, `Release from main`, and `Release` workflows in that order. If automation is interrupted before Maven Central accepts the version, re-run `Release` from the existing tag; never move a tag after publication:
+For `0.5.0`, commit the SDK changes with `VERSION_NAME=0.5.0`, its `CHANGELOG.md` section, and the matching README dependency example, then push or merge that commit to `main`. No manual tag is needed. Follow the `CI`, `Release from main`, and `Release` workflows in that order. If automation is interrupted before Maven Central accepts the version, re-run `Release` from the existing tag; never move a tag after publication:
 
 ```bash
-gh workflow run release.yml --repo taimoorq/logister-android --ref v0.3.0 -f version=0.3.0
+gh workflow run release.yml --repo taimoorq/logister-android --ref v0.5.0 -f version=0.5.0
 ```
 
 ## Security and contributing

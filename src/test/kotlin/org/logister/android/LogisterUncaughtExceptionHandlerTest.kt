@@ -8,13 +8,13 @@ class LogisterUncaughtExceptionHandlerTest {
     fun persistsBeforeDelegating() {
         val calls = mutableListOf<String>()
         val handler = LogisterUncaughtExceptionHandler(
-            capture = { calls += "capture" },
+            capture = { thread, _ -> calls += "capture:${thread.name}" },
             delegate = Thread.UncaughtExceptionHandler { _, _ -> calls += "delegate" },
         )
 
-        handler.uncaughtException(Thread.currentThread(), IllegalStateException("secret"))
+        handler.uncaughtException(Thread("checkout-crash"), IllegalStateException("secret"))
 
-        assertEquals(listOf("capture", "delegate"), calls)
+        assertEquals(listOf("capture:checkout-crash", "delegate"), calls)
     }
 
     @Test
@@ -23,7 +23,7 @@ class LogisterUncaughtExceptionHandlerTest {
         var delegations = 0
         lateinit var handler: LogisterUncaughtExceptionHandler
         handler = LogisterUncaughtExceptionHandler(
-            capture = {
+            capture = { _, _ ->
                 captures += 1
                 handler.uncaughtException(Thread.currentThread(), IllegalStateException("nested"))
                 throw AssertionError("telemetry failed")

@@ -62,4 +62,9 @@ internal class LogisterBreadcrumbBuffer(private val capacity: Int) {
 
     @Synchronized
     fun snapshot(): List<Map<String, Any>> = entries.map { it.asMap() }
+
+    @Synchronized
+    fun clear() {
+        entries.clear()
+    }
 }

@@ -54,6 +54,17 @@ jobs:
             exit 1
           fi
 
+      - name: Prepare release notes
+        env:
+          RELEASE_VERSION: ${{ steps.release_version.outputs.version }}
+        run: |
+          awk -v heading="## v${RELEASE_VERSION} " '
+            index($0, heading) == 1 { in_release = 1; next }
+            in_release && /^## v/ { exit }
+            in_release { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+
       - name: Set up JDK
         uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
         with:
@@ -69,7 +80,19 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
 
+      - name: Check Maven Central package version
+        id: maven_package
+        run: |
+          url="https://repo1.maven.org/maven2/org/logister/logister-android/${{ steps.release_version.outputs.version }}/logister-android-${{ steps.release_version.outputs.version }}.pom"
+          if curl --fail --silent --head --location "$url" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "logister-android ${{ steps.release_version.outputs.version }} already exists on Maven Central."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Verify secrets are configured
+        if: steps.maven_package.outputs.exists != 'true'
         env:
           MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
@@ -87,15 +110,40 @@ jobs:
         run: bash scripts/secret-scan.sh
 
       - name: Run release checks
-        run: ./gradlew clean check javaDocReleaseGeneration --no-daemon -PVERSION_NAME="${{ steps.release_version.outputs.version }}"
+        run: ./gradlew clean check assembleRelease javaDocReleaseGeneration --no-daemon -PVERSION_NAME="${{ steps.release_version.outputs.version }}"
+
+      - name: Inspect Android archive file list
+        run: |
+          archive="build/outputs/aar/logister-android-release.aar"
+          test -f "$archive"
+          if unzip -Z1 "$archive" | grep -Eq '(^|/)(\.env|tmp/release-|[^/]+\.(key|pem|p12|pfx))$|^/|\.\./'; then
+            echo "::error::Android archive contains a publication-unsafe path."
+            exit 1
+          fi
 
       - name: Publish signed deployment to Maven Central
+        if: steps.maven_package.outputs.exists != 'true'
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}
         run: ./gradlew publishToMavenCentral -PVERSION_NAME="${{ steps.release_version.outputs.version }}"
+
+      - name: Verify Maven Central publication
+        run: |
+          url="https://repo1.maven.org/maven2/org/logister/logister-android/${{ steps.release_version.outputs.version }}/logister-android-${{ steps.release_version.outputs.version }}.pom"
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --head --location "$url" >/dev/null; then
+              aar_url="${url%.pom}.aar"
+              curl --fail --silent --location "$aar_url" --output published.aar
+              cmp build/outputs/aar/logister-android-release.aar published.aar
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::Maven Central did not expose the release within the verification window."
+          exit 1
 
       - name: Create or update GitHub release
         env:
@@ -105,12 +153,12 @@ jobs:
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             gh release edit "$TAG_NAME" \
               --title "$TAG_NAME" \
-              --notes "Android SDK release $TAG_NAME" \
+              --notes-file release-notes.md \
               --latest
           else
             gh release create "$TAG_NAME" \
               --verify-tag \
               --title "$TAG_NAME" \
-              --notes "Android SDK release $TAG_NAME" \
+              --notes-file release-notes.md \
               --latest
           fi

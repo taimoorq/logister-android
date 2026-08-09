@@ -5,6 +5,7 @@ import java.net.InetSocketAddress
 import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class HttpUrlConnectionLogisterTransportTest {
@@ -32,6 +33,33 @@ class HttpUrlConnectionLogisterTransportTest {
 
             assertEquals(202, response.statusCode)
             assertEquals("logister-android/$LOGISTER_ANDROID_SDK_VERSION", userAgent.get())
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun parsesRetryAfterSecondsFromAThrottledResponse() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/api/v1/ingest") { exchange ->
+            exchange.requestBody.use { it.readBytes() }
+            exchange.responseHeaders.add("Retry-After", "12")
+            exchange.sendResponseHeaders(429, -1)
+            exchange.close()
+        }
+        server.start()
+
+        try {
+            val response = HttpUrlConnectionLogisterTransport().send(
+                endpoint = "http://127.0.0.1:${server.address.port}/api/v1/ingest",
+                mobileIngestToken = "short-lived",
+                envelope = JSONObject().put("event", JSONObject()),
+                connectTimeoutMs = 2_000,
+                readTimeoutMs = 2_000,
+            )
+            assertEquals(429, response.statusCode)
+            assertEquals(12_000L, response.retryAfterMillis)
+            assertTrue(!response.isAccepted)
         } finally {
             server.stop(0)
         }

@@ -13,6 +13,7 @@ public class LogisterEventOptions private constructor(builder: Builder) {
     public val traceId: String? = builder.traceId
     public val requestId: String? = builder.requestId
     public val sessionId: String? = builder.sessionId
+    public val sessionStartedAt: String? = builder.sessionStartedAt
     public val userId: String? = builder.userId
     public val transactionName: String? = builder.transactionName
     public val durationMs: Double? = builder.durationMs
@@ -31,6 +32,7 @@ public class LogisterEventOptions private constructor(builder: Builder) {
         internal var traceId: String? = null
         internal var requestId: String? = null
         internal var sessionId: String? = null
+        internal var sessionStartedAt: String? = null
         internal var userId: String? = null
         internal var transactionName: String? = null
         internal var durationMs: Double? = null
@@ -70,6 +72,11 @@ public class LogisterEventOptions private constructor(builder: Builder) {
 
         public fun sessionId(sessionId: String?): Builder = apply {
             this.sessionId = sessionId
+        }
+
+        /** UTC ISO-8601 start time for the supplied session ID. */
+        public fun sessionStartedAt(sessionStartedAt: String?): Builder = apply {
+            this.sessionStartedAt = sessionStartedAt
         }
 
         public fun userId(userId: String?): Builder = apply {

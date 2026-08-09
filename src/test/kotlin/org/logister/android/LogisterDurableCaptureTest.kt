@@ -21,11 +21,19 @@ class LogisterDurableCaptureTest {
         assertTrue(response.isQueued)
         assertEquals(1, client.queuedEventCount())
         assertEquals(0, transport.envelopes.size)
+        val queuedEvent = JSONObject(
+            JSONArray((queueStore(queue)).value).getJSONObject(0).getString("envelope"),
+        ).getJSONObject("event")
+        val queuedUuid = queuedEvent.getString("uuid")
+        val queuedOccurredAt = queuedEvent.getString("occurred_at")
 
         tokenProvider.token = LogisterToken("short-lived", futureEpochSeconds())
         assertEquals(1, client.flushQueuedEvents())
         assertEquals(0, client.queuedEventCount())
-        assertEquals("queued event", transport.envelopes.single().getJSONObject("event").getString("message"))
+        val deliveredEvent = transport.envelopes.single().getJSONObject("event")
+        assertEquals("queued event", deliveredEvent.getString("message"))
+        assertEquals(queuedUuid, deliveredEvent.getString("uuid"))
+        assertEquals(queuedOccurredAt, deliveredEvent.getString("occurred_at"))
     }
 
     @Test
@@ -46,7 +54,7 @@ class LogisterDurableCaptureTest {
             IllegalArgumentException("private nested detail"),
         )
 
-        client.captureUncaughtException(throwable)
+        client.captureUncaughtException(Thread("checkout-crash"), throwable)
 
         val stored = JSONArray(store.value).getJSONObject(0)
         val event = JSONObject(stored.getString("envelope")).getJSONObject("event")
@@ -60,6 +68,8 @@ class LogisterDurableCaptureTest {
             context.getJSONObject("error").getString("data_policy"),
         )
         assertEquals("unhandled_exception", context.getJSONObject("error").getString("mechanism"))
+        assertEquals("crashed", context.getJSONObject("error").getString("thread_role"))
+        assertEquals("checkout-crash", context.getJSONObject("error").getString("thread_name"))
         assertFalse(context.getJSONObject("error").getBoolean("handled"))
     }
 
@@ -113,6 +123,67 @@ class LogisterDurableCaptureTest {
         assertEquals(1, client.queuedEventCount())
     }
 
+    @Test
+    fun disablingCollectionPurgesQueuedDataAndDropsFutureCapture() {
+        val tokenProvider = MutableTokenProvider()
+        val transport = RecordingTransport()
+        val client = client(tokenProvider, transport)
+        client.attachOfflineQueue(queue())
+        client.addBreadcrumb(LogisterBreadcrumb.builder("private trail").build())
+        assertTrue(client.captureMessageAsync("queued before opt out").get().isQueued)
+        assertEquals(1, client.queuedEventCount())
+
+        client.setCollectionEnabled(false)
+
+        assertFalse(client.isCollectionEnabled())
+        assertEquals(0, client.queuedEventCount())
+        val response = client.captureMessageAsync("must not send").get()
+        assertFalse(response.isAccepted)
+        assertFalse(response.isQueued)
+        assertEquals("dropped: collection disabled", response.body)
+        assertEquals(0, transport.envelopes.size)
+    }
+
+    @Test
+    fun beforeSendCanDiscardWithoutAuthenticationOrPersistence() {
+        val tokenProvider = MutableTokenProvider()
+        val transport = RecordingTransport()
+        val client = LogisterClient.builder(tokenProvider, "https://logister.example")
+            .includeDeviceContext(false)
+            .beforeSend(LogisterBeforeSend { null })
+            .transport(transport)
+            .executor(Executors.newSingleThreadExecutor())
+            .build()
+        client.attachOfflineQueue(queue())
+
+        val response = client.captureMessageAsync("discard me").get()
+
+        assertTrue(response.isDropped)
+        assertEquals(1, client.healthSnapshot().discardedEventCount)
+        assertEquals(0, client.queuedEventCount())
+        assertEquals(0, transport.envelopes.size)
+    }
+
+    @Test
+    fun permanentClientRejectionIsCountedAndNeverPoisonsTheQueue() {
+        val client = LogisterClient.builder(
+            LogisterTokenProvider { LogisterToken("short-lived", futureEpochSeconds()) },
+            "https://logister.example",
+        )
+            .includeDeviceContext(false)
+            .transport(LogisterTransport { _, _, _, _, _ -> LogisterResponse(422) })
+            .executor(Executors.newSingleThreadExecutor())
+            .build()
+        client.attachOfflineQueue(queue())
+
+        val response = client.captureMessageAsync("invalid").get()
+
+        assertEquals(422, response.statusCode)
+        assertEquals(0, client.queuedEventCount())
+        assertEquals(1, client.healthSnapshot().discardedEventCount)
+        assertEquals("permanent HTTP 422", client.healthSnapshot().lastError)
+    }
+
     private fun client(
         tokenProvider: LogisterTokenProvider,
         transport: LogisterTransport,
@@ -123,13 +194,21 @@ class LogisterDurableCaptureTest {
         .executor(Executors.newSingleThreadExecutor())
         .build()
 
-    private fun queue(): LogisterOfflineQueue = LogisterOfflineQueue(
-        store = InMemoryEnvelopeStore(),
+    private val queueStores = java.util.IdentityHashMap<LogisterOfflineQueue, InMemoryEnvelopeStore>()
+
+    private fun queue(): LogisterOfflineQueue {
+        val store = InMemoryEnvelopeStore()
+        return LogisterOfflineQueue(
+        store = store,
         maxEvents = 10,
         maxBytes = 64 * 1024,
         maxAgeDays = 7,
         nowMillis = { 1_000L },
-    )
+        ).also { queueStores[it] = store }
+    }
+
+    private fun queueStore(queue: LogisterOfflineQueue): InMemoryEnvelopeStore =
+        requireNotNull(queueStores[queue])
 
     private fun futureEpochSeconds(): Long = System.currentTimeMillis() / 1_000 + 300
 }

@@ -3,7 +3,7 @@ package org.logister.android
 import java.util.concurrent.atomic.AtomicBoolean
 
 internal class LogisterUncaughtExceptionHandler(
-    private val capture: (Throwable) -> Unit,
+    private val capture: (Thread, Throwable) -> Unit,
     private val delegate: Thread.UncaughtExceptionHandler,
 ) : Thread.UncaughtExceptionHandler {
     private val reporting = AtomicBoolean(false)
@@ -14,7 +14,7 @@ internal class LogisterUncaughtExceptionHandler(
     ) {
         if (reporting.compareAndSet(false, true)) {
             try {
-                capture(throwable)
+                capture(thread, throwable)
             } catch (_: Throwable) {
                 // Telemetry must never replace Android's existing crash behavior.
             } finally {

@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "org.logister"
-version = providers.gradleProperty("VERSION_NAME").orNull ?: "0.3.0-SNAPSHOT"
+version = providers.gradleProperty("VERSION_NAME").orNull ?: "0.5.0-SNAPSHOT"
 
 android {
     namespace = "org.logister.android"
