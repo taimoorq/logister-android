@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.2 - 2026-09-11
+
+- Added the independently verified Linux AAPT2 checksum required to assemble the release on hosted CI, and made pull-request CI assemble the same release artifact.
+- Includes all 0.5.1 changes. The 0.5.1 tag failed before Maven publication and remains unchanged.
+
 ## v0.5.1 - 2026-09-11
 
 - Updated AGP to 9.3.2, Gradle to 9.7.1, and the test JSON implementation to 20260814 while preserving Java 17 and Android API floors.

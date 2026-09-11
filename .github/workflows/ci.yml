@@ -45,4 +45,4 @@ jobs:
         run: bash scripts/validate-release-metadata.sh
 
       - name: Run release checks
-        run: ./gradlew clean check javaDocReleaseGeneration --no-daemon
+        run: ./gradlew clean check assembleRelease javaDocReleaseGeneration --no-daemon

@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import org.json.JSONArray
 import org.json.JSONObject
 
-internal const val LOGISTER_ANDROID_SDK_VERSION: String = "0.5.1"
+internal const val LOGISTER_ANDROID_SDK_VERSION: String = "0.5.2"
 
 /** Main Android client for sending telemetry to Logister. */
 public class LogisterClient private constructor(
