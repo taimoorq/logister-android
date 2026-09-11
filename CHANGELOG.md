@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.1 - 2026-09-11
+
+- Updated AGP to 9.3.2, Gradle to 9.7.1, and the test JSON implementation to 20260814 while preserving Java 17 and Android API floors.
+- Refreshed pinned GitHub Actions and dependency verification metadata.
+- Restored explicit release dispatch and immutable-tag recovery from main; scheduled dependency checks cannot publish.
+- Includes the previously unpublished durable-delivery and mobile-evidence improvements from 0.4 and 0.5.
+
 ## v0.5.0 - 2026-08-09
 
 - Added bounded, structured Android 11+ ANR thread evidence from `ApplicationExitInfo.traceInputStream` without persisting the raw trace text, lock annotations, process command line, or other arbitrary lines.

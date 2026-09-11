@@ -1,10 +1,10 @@
 plugins {
-    id("com.android.library") version "9.3.1"
+    id("com.android.library") version "9.3.2"
     id("com.vanniktech.maven.publish") version "0.37.0"
 }
 
 group = "org.logister"
-version = providers.gradleProperty("VERSION_NAME").orNull ?: "0.5.0-SNAPSHOT"
+version = providers.gradleProperty("VERSION_NAME").orNull ?: "0.5.1-SNAPSHOT"
 
 android {
     namespace = "org.logister.android"
@@ -30,7 +30,7 @@ kotlin {
 
 dependencies {
     testImplementation("junit:junit:4.13.2")
-    testImplementation("org.json:json:20260719")
+    testImplementation("org.json:json:20260814")
 }
 
 mavenPublishing {

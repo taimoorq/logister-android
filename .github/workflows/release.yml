@@ -6,16 +6,19 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      version:
-        description: Version to publish, for example 0.1.1.
+      tag:
+        description: Existing immutable vX.Y.Z tag to publish or recover
         required: true
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   publish:
@@ -24,35 +27,25 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Verify immutable tag belongs to reviewed main
+        run: bash scripts/verify-release-ref.sh
 
       - name: Set release version
         id: release_version
-        env:
-          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          if [ -n "${INPUT_VERSION:-}" ]; then
-            version="$INPUT_VERSION"
-          else
-            version="${GITHUB_REF_NAME#v}"
-          fi
-
-          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'; then
-            echo "::error::Version must be semantic, for example 0.1.1."
-            exit 1
-          fi
-
+          version="${RELEASE_TAG#v}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Verify checked-in version
         run: |
           actual="${{ steps.release_version.outputs.version }}"
           bash scripts/validate-release-metadata.sh "$actual"
 
-          if [ "$GITHUB_REF_TYPE" != "tag" ] || [ "$GITHUB_REF_NAME" != "v$actual" ]; then
-            echo "::error::Release v$actual must run from its exact v$actual tag, not $GITHUB_REF."
-            exit 1
-          fi
 
       - name: Prepare release notes
         env:
@@ -66,7 +59,7 @@ jobs:
           test -s release-notes.md
 
       - name: Set up JDK
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
         with:
           distribution: temurin
           java-version: "17"
@@ -78,18 +71,18 @@ jobs:
         run: sdkmanager "platforms;android-36"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
 
       - name: Check Maven Central package version
         id: maven_package
         run: |
           url="https://repo1.maven.org/maven2/org/logister/logister-android/${{ steps.release_version.outputs.version }}/logister-android-${{ steps.release_version.outputs.version }}.pom"
-          if curl --fail --silent --head --location "$url" >/dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "logister-android ${{ steps.release_version.outputs.version }} already exists on Maven Central."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
+          status="$(curl --silent --show-error --head --location --output /dev/null --write-out '%{http_code}' "$url")"
+          case "$status" in
+            200) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::Maven lookup failed with HTTP $status; publication state is unknown."; exit 1 ;;
+          esac
 
       - name: Verify secrets are configured
         if: steps.maven_package.outputs.exists != 'true'
