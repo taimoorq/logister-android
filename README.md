@@ -34,7 +34,7 @@ Install the Android SDK from Maven Central:
 
 ```kotlin
 dependencies {
-    implementation("org.logister:logister-android:0.5.0")
+    implementation("org.logister:logister-android:0.5.1")
 }
 ```
 
@@ -289,10 +289,10 @@ curl -fsSI https://repo1.maven.org/maven2/org/logister/logister-android/X.Y.Z/lo
 gh release view vX.Y.Z
 ```
 
-For `0.5.0`, commit the SDK changes with `VERSION_NAME=0.5.0`, its `CHANGELOG.md` section, and the matching README dependency example, then push or merge that commit to `main`. No manual tag is needed. Follow the `CI`, `Release from main`, and `Release` workflows in that order. If automation is interrupted before Maven Central accepts the version, re-run `Release` from the existing tag; never move a tag after publication:
+For `0.5.1`, commit the SDK changes with `VERSION_NAME=0.5.1`, its `CHANGELOG.md` section, and the matching README dependency example, then push or merge that commit to `main`. No manual tag is needed. Follow the `CI`, `Release from main`, and `Release` workflows in that order. If automation is interrupted before Maven Central accepts the version, re-run `Release` from the existing tag; never move a tag after publication:
 
 ```bash
-gh workflow run release.yml --repo taimoorq/logister-android --ref v0.5.0 -f version=0.5.0
+gh workflow run release.yml --repo taimoorq/logister-android --ref main -f tag=v0.5.1
 ```
 
 ## Security and contributing
@@ -319,3 +319,22 @@ gh secret set SIGNING_PASSWORD --repo taimoorq/logister-android
 ```
 
 For server-side token issuance and mobile deployment guidance, read the [Android integration guide](https://logister.org/docs/integrations/android/) and the main app's [mobile add-ons reference](https://github.com/taimoorq/logister/blob/main/docs/mobile-add-ons.md).
+
+
+### Coordinated release preparation
+
+For a coordinated ecosystem release, keep the version-changing PR unmerged until
+the final agreed Rails PR has been published and its deployment verified. Recheck
+the upstream contract/workflow pin against that final backend commit before merge.
+Successful source CI, a tag, or a release-impact dispatch alone is not backend readiness.
+After independent review, merging the new version runs CI, creates an immutable tag,
+and explicitly dispatches publication. A tag without a package remains incomplete.
+
+To recover an existing reviewed tag, dispatch the publisher workflow from `main`
+with `-f tag=vX.Y.Z` (Python uses `publish.yml`; other SDKs use `release.yml`). The
+workflow checks out that exact tag, proves it belongs to main, and verifies public
+package identity before creating the GitHub Release. Never move a consumed tag.
+
+Weekly CI audits/tests current dependencies and cannot trigger automatic publication.
+Dependabot groups compatible minor/patch updates; major toolchain migrations keep
+separate PRs. Pin Actions to full commits and retain supported runtime floors.

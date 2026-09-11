@@ -21,3 +21,5 @@ signing-key.*
 private-key.*
 gradle-local.properties
 credentials.properties
+
+__pycache__/
