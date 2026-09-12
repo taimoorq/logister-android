@@ -47,6 +47,10 @@ metadata before retrying. Do not disable dependency verification.
   deployment before creating the GitHub Release. The upload task may finish
   while Central says the deployment is being published; wait for the public
   POM and AAR before calling the release complete.
+- The publisher waits for Central's `PUBLISHED` deployment state and retains the
+  tested unsigned AAR for 30 days. Follow [release recovery](docs/release-recovery.md)
+  when propagation or verification fails; do not reupload an accepted version
+  while its original deployment is still being published.
 - A failed pre-publication run can leave a tag without a package or GitHub
   Release. Only in that narrow case may the failed tag be repaired to the
   verified commit. Never move a tag after Maven Central accepted the version.

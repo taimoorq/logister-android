@@ -23,6 +23,7 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
       - name: Check out repository
@@ -114,6 +115,14 @@ jobs:
             exit 1
           fi
 
+      - name: Retain the tested Android archive for recovery
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: logister-android-${{ steps.release_version.outputs.version }}-${{ github.run_attempt }}
+          path: build/outputs/aar/logister-android-release.aar
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Publish signed deployment to Maven Central
         if: steps.maven_package.outputs.exists != 'true'
         env:
@@ -121,7 +130,9 @@ jobs:
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_PASSWORD }}
-        run: ./gradlew publishToMavenCentral -PVERSION_NAME="${{ steps.release_version.outputs.version }}"
+        # Central can take 10–30 minutes to expose a validated deployment.
+        # Wait on its existing deployment before checking the public CDN.
+        run: ./gradlew publishToMavenCentral -PmavenCentralDeploymentValidation=PUBLISHED -PVERSION_NAME="${{ steps.release_version.outputs.version }}"
 
       - name: Verify Maven Central publication
         run: |
