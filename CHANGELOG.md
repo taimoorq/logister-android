@@ -2,6 +2,8 @@
 
 ## v0.6.0 - 2026-09-24
 
+- Configure CI, release, and dependency submission to install platform-tools explicitly; the removed legacy tools package must not block SDK setup.
+
 - Add immutable W3C request handles and an opt-in HttpURLConnection wrapper.
 - Add the optional org.logister:logister-android-okhttp artifact, with call-local context and per-hop allowlist enforcement across redirects.
 
