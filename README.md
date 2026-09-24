@@ -34,7 +34,7 @@ Install the Android SDK from Maven Central:
 
 ```kotlin
 dependencies {
-    implementation("org.logister:logister-android:0.5.2")
+    implementation("org.logister:logister-android:0.6.0")
 }
 ```
 
@@ -289,10 +289,10 @@ curl -fsSI https://repo1.maven.org/maven2/org/logister/logister-android/X.Y.Z/lo
 gh release view vX.Y.Z
 ```
 
-For `0.5.2`, commit the SDK changes with `VERSION_NAME=0.5.2`, its `CHANGELOG.md` section, and the matching README dependency example, then push or merge that commit to `main`. No manual tag is needed. Follow the `CI`, `Release from main`, and `Release` workflows in that order. If automation is interrupted before Maven Central accepts the version, re-run `Release` from the existing tag; never move a tag after publication:
+For `0.6.0`, commit the SDK changes with `VERSION_NAME=0.6.0`, its `CHANGELOG.md` section, and the matching README dependency example, then push or merge that commit to `main`. No manual tag is needed. Follow the `CI`, `Release from main`, and `Release` workflows in that order. If automation is interrupted before Maven Central accepts the version, re-run `Release` from the existing tag; never move a tag after publication:
 
 ```bash
-gh workflow run release.yml --repo taimoorq/logister-android --ref main -f tag=v0.5.2
+gh workflow run release.yml --repo taimoorq/logister-android --ref main -f tag=v0.6.0
 ```
 
 ## Security and contributing
@@ -338,3 +338,53 @@ package identity before creating the GitHub Release. Never move a consumed tag.
 Weekly CI audits/tests current dependencies and cannot trigger automatic publication.
 Dependabot groups compatible minor/patch updates; major toolchain migrations keep
 separate PRs. Pin Actions to full commits and retain supported runtime floors.
+
+## Request correlation (0.6.0+)
+
+Opt into backend HTTP tracing with exact-origin allowlists. The core artifact
+provides `LogisterHttpClient` for HttpURLConnection; call it off the main thread,
+consume the response inside `execute`, and handle redirects explicitly.
+
+For OkHttp, add the optional artifact and install its interceptors last:
+
+```kotlin
+implementation("org.logister:logister-android-okhttp:0.6.0")
+```
+
+```kotlin
+import org.logister.android.LogisterTraceContext
+import org.logister.android.okhttp.LogisterOkHttpInterceptor
+
+val http = LogisterOkHttpInterceptor(
+    client,
+    allowedOrigins = listOf("https://api.example.test"),
+    excludedUrls = listOf("https://api.example.test/mobile-token")
+).install(OkHttpClient.Builder()).build()
+
+http.newCall(Request.Builder().url("https://api.example.test/orders").build()).execute().use { response ->
+    val trace = response.request.tag(LogisterTraceContext::class.java)
+    if (response.code >= 500 && trace != null) {
+        client.captureExceptionAsync(IllegalStateException("Order request failed"), trace.eventOptions())
+    }
+}
+```
+
+The optional module depends on OkHttp 5.1. Core users do not gain an OkHttp runtime
+dependency. Each network attempt gets a new span in the call's trace; redirects
+to unapproved origins have trace headers stripped. A response tag identifies the
+final instrumented attempt. `LogisterOkHttpException` exposes the handle for an
+I/O failure after the network interceptor started; DNS/connect failures before
+that point have no transmitted request identity. The SDK exporter is excluded;
+list token endpoints explicitly. Native crashes and historical exits are never
+assigned a guessed request. Both Android artifacts share one release version.
+
+A linked-project lookup also requires Logister 3.7+, the instance flag
+`LOGISTER_CROSS_PROJECT_CORRELATIONS=true`, and explicit project/environment
+connections under Settings → Integrations → Connected projects. Enable related
+requests on both projects. A connection never grants project access.
+
+Use the returned request handle when reporting a handled HTTP failure later.
+Do not attach the most recent request to an unrelated crash or OS diagnostic.
+Configure each app's own `release` and `environment`; mobile and backend releases
+are independent. The backend shows exact identifier evidence and retention gaps.
+See the [request correlation guide](https://logister.org/docs/request-correlation/).

@@ -67,6 +67,8 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: platform-tools
 
       - name: Install Android platform
         run: sdkmanager "platforms;android-36"
@@ -77,12 +79,20 @@ jobs:
       - name: Check Maven Central package version
         id: maven_package
         run: |
-          url="https://repo1.maven.org/maven2/org/logister/logister-android/${{ steps.release_version.outputs.version }}/logister-android-${{ steps.release_version.outputs.version }}.pom"
-          status="$(curl --silent --show-error --head --location --output /dev/null --write-out '%{http_code}' "$url")"
-          case "$status" in
-            200) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
-            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
-            *) echo "::error::Maven lookup failed with HTTP $status; publication state is unknown."; exit 1 ;;
+          present=0
+          for artifact in logister-android logister-android-okhttp; do
+            url="https://repo1.maven.org/maven2/org/logister/$artifact/${{ steps.release_version.outputs.version }}/$artifact-${{ steps.release_version.outputs.version }}.pom"
+            status="$(curl --silent --show-error --head --location --output /dev/null --write-out '%{http_code}' "$url")"
+            case "$status" in
+              200) present=$((present + 1)) ;;
+              404) ;;
+              *) echo "::error::Maven lookup failed with HTTP $status; publication state is unknown."; exit 1 ;;
+            esac
+          done
+          case "$present" in
+            0) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::Only one Android artifact is public. Recover the existing deployment before retrying; do not reupload an accepted artifact."; exit 1 ;;
           esac
 
       - name: Verify secrets are configured
@@ -108,18 +118,21 @@ jobs:
 
       - name: Inspect Android archive file list
         run: |
-          archive="build/outputs/aar/logister-android-release.aar"
-          test -f "$archive"
-          if unzip -Z1 "$archive" | grep -Eq '(^|/)(\.env|tmp/release-|[^/]+\.(key|pem|p12|pfx))$|^/|\.\./'; then
-            echo "::error::Android archive contains a publication-unsafe path."
-            exit 1
-          fi
+          for archive in build/outputs/aar/logister-android-release.aar okhttp/build/outputs/aar/okhttp-release.aar; do
+            test -f "$archive"
+            if unzip -Z1 "$archive" | grep -Eq '(^|/)(\.env|tmp/release-|[^/]+\.(key|pem|p12|pfx))$|^/|\.\./'; then
+              echo "::error::Android archive contains a publication-unsafe path."
+              exit 1
+            fi
+          done
 
       - name: Retain the tested Android archive for recovery
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: logister-android-${{ steps.release_version.outputs.version }}-${{ github.run_attempt }}
-          path: build/outputs/aar/logister-android-release.aar
+          path: |
+            build/outputs/aar/logister-android-release.aar
+            okhttp/build/outputs/aar/okhttp-release.aar
           if-no-files-found: error
           retention-days: 30
 
@@ -136,18 +149,24 @@ jobs:
 
       - name: Verify Maven Central publication
         run: |
-          url="https://repo1.maven.org/maven2/org/logister/logister-android/${{ steps.release_version.outputs.version }}/logister-android-${{ steps.release_version.outputs.version }}.pom"
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent --head --location "$url" >/dev/null; then
-              aar_url="${url%.pom}.aar"
-              curl --fail --silent --location "$aar_url" --output published.aar
-              cmp build/outputs/aar/logister-android-release.aar published.aar
-              exit 0
+          for artifact in logister-android logister-android-okhttp; do
+            url="https://repo1.maven.org/maven2/org/logister/$artifact/${{ steps.release_version.outputs.version }}/$artifact-${{ steps.release_version.outputs.version }}.pom"
+            local_aar="build/outputs/aar/logister-android-release.aar"
+            if [ "$artifact" = logister-android-okhttp ]; then local_aar="okhttp/build/outputs/aar/okhttp-release.aar"; fi
+            verified=false
+            for attempt in $(seq 1 30); do
+              if curl --fail --silent --head --location "$url" >/dev/null && curl --fail --silent --location "${url%.pom}.aar" --output "published-$artifact.aar"; then
+                cmp "$local_aar" "published-$artifact.aar"
+                verified=true
+                break
+              fi
+              sleep 20
+            done
+            if [ "$verified" != true ]; then
+              echo "::error::Maven Central did not expose $artifact within the verification window."
+              exit 1
             fi
-            sleep 20
           done
-          echo "::error::Maven Central did not expose the release within the verification window."
-          exit 1
 
       - name: Create or update GitHub release
         env:
