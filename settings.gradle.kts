@@ -15,3 +15,5 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "logister-android"
+
+include(":okhttp")

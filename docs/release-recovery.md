@@ -22,3 +22,10 @@ Central publication can take [10–30 minutes](https://vanniktech.github.io/grad
 The version check skips upload. The workflow checks the reviewed tag, rebuilds and compares the archive with the public AAR, and completes the GitHub Release only after byte verification. If bytes differ, stop and compare the public file with the retained original workflow artifact; do not publish another artifact over that version.
 
 Keep workflow-only recovery changes outside the published SDK inputs. They do not require a new SDK version or rewriting a consumed tag.
+
+
+From 0.6.0, both `logister-android` and `logister-android-okhttp` must expose the
+same version's POM and AAR. CI retains both tested AARs. If only one artifact is
+public, the release workflow stops: inspect the existing Central deployment and
+finish recovery without reuploading the accepted artifact. Do not create the
+GitHub Release until both downloaded AARs match the retained build outputs.

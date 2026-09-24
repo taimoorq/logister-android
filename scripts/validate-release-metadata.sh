@@ -45,4 +45,9 @@ if ! grep -Fq "LOGISTER_ANDROID_SDK_VERSION: String = \"$checked_in_version\"" s
   exit 1
 fi
 
+if ! grep -Fq "org.logister:logister-android-okhttp:$checked_in_version" README.md; then
+  echo "README.md must show the matching optional OkHttp coordinate." >&2
+  exit 1
+fi
+
 echo "Release metadata is consistent for v$checked_in_version."
