@@ -44,6 +44,66 @@ class LogisterOkHttpTest {
         } finally { executor.shutdownNow() }
     }
 
+    @Test fun capturesDnsFailureBeforeNetworkInterceptorsWithoutDuplicates() {
+        val envelopes = java.util.Collections.synchronizedList(mutableListOf<org.json.JSONObject>())
+        val captured = java.util.concurrent.CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+        val client = LogisterClient.builder(LogisterTokenProvider { LogisterToken("synthetic", System.currentTimeMillis() / 1000 + 300) }, "https://logister.example")
+            .includeDeviceContext(false).executor(executor).transport(LogisterTransport { _, _, envelope, _, _ -> envelopes.add(envelope); captured.countDown(); LogisterResponse(202) }).build()
+        val http = LogisterOkHttpInterceptor(client, listOf("https://api.example")).install(OkHttpClient.Builder()
+            .dns { throw java.net.UnknownHostException("synthetic DNS failure") }).build()
+        try {
+            try {
+                http.newCall(Request.Builder().url("https://api.example/work").build()).execute().close()
+                fail("Expected DNS failure")
+            } catch (error: LogisterOkHttpException) {
+                assertTrue(error.cause is java.net.UnknownHostException)
+                assertTrue(captured.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                assertEquals(1, envelopes.size)
+                val event = envelopes.first().getJSONObject("event")
+                val context = event.getJSONObject("context")
+                assertEquals(error.traceContext.traceId, context.getString("trace_id"))
+                val metadata = context.getJSONObject("http")
+                assertEquals("dns", metadata.getString("failure_kind"))
+                assertEquals(1, metadata.getInt("attempt"))
+                assertFalse(metadata.has("status_code"))
+            }
+        } finally {
+            executor.shutdownNow()
+            http.dispatcher.executorService.shutdown()
+            http.connectionPool.evictAll()
+        }
+    }
+
+    @Test fun responseMetadataKeepsSuccessfulAndClientErrorResponsesUnchanged() {
+        val envelopes = java.util.Collections.synchronizedList(mutableListOf<org.json.JSONObject>())
+        val captured = java.util.concurrent.CountDownLatch(2)
+        val executor = Executors.newSingleThreadExecutor()
+        val client = LogisterClient.builder(LogisterTokenProvider { LogisterToken("synthetic", System.currentTimeMillis() / 1000 + 300) }, "https://logister.example")
+            .includeDeviceContext(false).executor(executor).transport(LogisterTransport { _, _, envelope, _, _ -> envelopes.add(envelope); captured.countDown(); LogisterResponse(202) }).build()
+        try {
+            for (status in listOf(200, 429)) {
+                ServerSocket(0).use { server ->
+                    val responder = serve(server, mutableMapOf(), "$status Result", "")
+                    val origin = "http://localhost:${server.localPort}"
+                    val http = LogisterOkHttpInterceptor(client, listOf(origin)).install(OkHttpClient.Builder()).build()
+                    try {
+                        http.newCall(Request.Builder().url("$origin/work").build()).execute().use { response ->
+                            assertEquals(status, response.code)
+                            assertNotNull(response.request.tag(LogisterTraceContext::class.java))
+                        }
+                        responder.join(5000)
+                    } finally { http.dispatcher.executorService.shutdown(); http.connectionPool.evictAll() }
+                }
+            }
+            assertTrue(captured.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            val metadata = envelopes.map { it.getJSONObject("event").getJSONObject("context").getJSONObject("http") }
+            assertFalse(metadata.first { it.getInt("status_code") == 200 }.has("failure_kind"))
+            assertEquals("http", metadata.first { it.getInt("status_code") == 429 }.getString("failure_kind"))
+            metadata.forEach { assertEquals("response_headers", it.getString("duration_scope")); assertEquals(1, it.getInt("attempt")) }
+        } finally { executor.shutdownNow() }
+    }
+
     private fun serve(server: ServerSocket, headers: MutableMap<String, String>, status: String, extra: String): Thread = Thread {
         server.soTimeout = 5000
         server.accept().use { socket ->

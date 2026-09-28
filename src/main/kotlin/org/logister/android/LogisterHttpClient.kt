@@ -37,6 +37,8 @@ public class LogisterHttpClient(
         val started = System.nanoTime()
         var connection: HttpURLConnection? = null
         var failed = false
+        var statusCode: Int? = null
+        var failureKind: String? = null
         try {
             connection = URL(url).openConnection() as HttpURLConnection
             connection.instanceFollowRedirects = false
@@ -46,17 +48,31 @@ public class LogisterHttpClient(
             headers.filterKeys { trace != null || it.lowercase() !in setOf("traceparent", "tracestate", "x-request-id") }.forEach { (key, value) -> connection.setRequestProperty(key, value) }
             propagated.forEach { (key, value) -> connection.setRequestProperty(key, value) }
             val value = block(connection)
-            failed = connection.responseCode >= 500
+            statusCode = connection.responseCode
+            failed = statusCode >= 500
+            if (statusCode >= 400) failureKind = "http"
             return LogisterHttpResult(value, trace)
         } catch (error: Exception) {
             failed = true
+            failureKind = when (error) {
+                is java.net.SocketTimeoutException -> "timeout"
+                is java.net.UnknownHostException -> "dns"
+                is javax.net.ssl.SSLException -> "tls"
+                is java.net.ConnectException, is java.net.SocketException -> "connection"
+                is java.io.InterruptedIOException -> "cancelled"
+                is java.io.IOException -> "transport"
+                else -> "application"
+            }
             throw LogisterHttpRequestException(error, trace)
         } finally {
             connection?.disconnect()
             if (trace != null) {
+                val metadata = mutableMapOf<String, Any>("method" to method.uppercase(Locale.ROOT).take(16), "attempt" to 1, "duration_scope" to "callback")
+                statusCode?.let { metadata["status_code"] = it }
+                failureKind?.let { metadata["failure_kind"] = it }
                 val span = LogisterSpan.builder(trace.traceId, operation.take(200), (System.nanoTime() - started) / 1_000_000.0)
                     .spanId(trace.spanId).parentSpanId(trace.parentSpanId).kind("http").status(if (failed) "error" else "ok")
-                    .startedAt(startedAt).context(trace.context).build()
+                    .startedAt(startedAt).context(trace.context + ("http" to metadata)).build()
                 try { client.captureSpanAsync(span, trace.eventOptions()) } catch (_: Exception) { /* Preserve the application's result. */ }
             }
         }

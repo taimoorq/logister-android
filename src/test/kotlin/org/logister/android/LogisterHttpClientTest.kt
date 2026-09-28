@@ -48,6 +48,12 @@ class LogisterHttpClientTest {
                     assertEquals(trace.traceId, envelope.getJSONObject("event").getJSONObject("context").getString("trace_id"))
                     assertEquals(trace.spanId, envelope.getJSONObject("event").getJSONObject("context").getString("span_id"))
                 }
+                val span = envelopes.first { it.getJSONObject("event").getString("event_type") == "span" }.getJSONObject("event")
+                val httpMetadata = span.getJSONObject("context").getJSONObject("http")
+                assertEquals(503, httpMetadata.getInt("status_code"))
+                assertEquals("GET", httpMetadata.getString("method"))
+                assertEquals("http", httpMetadata.getString("failure_kind"))
+                assertEquals("callback", httpMetadata.getString("duration_scope"))
                 System.getenv("LOGISTER_CORRELATION_FIXTURES")?.let { directory ->
                     File(directory, "android.json").writeText(JSONObject().put("headers", JSONObject(mapOf("traceparent" to trace.traceparent, "x-request-id" to trace.requestId)))
                         .put("envelopes", JSONArray(envelopes)).toString(2))
