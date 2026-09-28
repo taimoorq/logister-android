@@ -34,7 +34,7 @@ Install the Android SDK from Maven Central:
 
 ```kotlin
 dependencies {
-    implementation("org.logister:logister-android:0.6.0")
+    implementation("org.logister:logister-android:0.6.1")
 }
 ```
 
@@ -289,10 +289,10 @@ curl -fsSI https://repo1.maven.org/maven2/org/logister/logister-android/X.Y.Z/lo
 gh release view vX.Y.Z
 ```
 
-For `0.6.0`, commit the SDK changes with `VERSION_NAME=0.6.0`, its `CHANGELOG.md` section, and the matching README dependency example, then push or merge that commit to `main`. No manual tag is needed. Follow the `CI`, `Release from main`, and `Release` workflows in that order. If automation is interrupted before Maven Central accepts the version, re-run `Release` from the existing tag; never move a tag after publication:
+For `0.6.1`, commit the SDK changes with `VERSION_NAME=0.6.1`, its `CHANGELOG.md` section, and the matching README dependency example, then push or merge that commit to `main`. No manual tag is needed. Follow the `CI`, `Release from main`, and `Release` workflows in that order. If automation is interrupted before Maven Central accepts the version, re-run `Release` from the existing tag; never move a tag after publication:
 
 ```bash
-gh workflow run release.yml --repo taimoorq/logister-android --ref main -f tag=v0.6.0
+gh workflow run release.yml --repo taimoorq/logister-android --ref main -f tag=v0.6.1
 ```
 
 ## Security and contributing
@@ -348,7 +348,7 @@ consume the response inside `execute`, and handle redirects explicitly.
 For OkHttp, add the optional artifact and install its interceptors last:
 
 ```kotlin
-implementation("org.logister:logister-android-okhttp:0.6.0")
+implementation("org.logister:logister-android-okhttp:0.6.1")
 ```
 
 ```kotlin
@@ -388,3 +388,19 @@ Do not attach the most recent request to an unrelated crash or OS diagnostic.
 Configure each app's own `release` and `environment`; mobile and backend releases
 are independent. The backend shows exact identifier evidence and retention gaps.
 See the [request correlation guide](https://logister.org/docs/request-correlation/).
+
+### HTTP evidence (0.6.1+)
+
+Traced HTTP spans include optional `context.http` fields: `method`,
+`status_code` when a response is available, `failure_kind`, `attempt`, and
+`duration_scope`. Failure categories distinguish HTTP 4xx/5xx responses from
+transport failures such as timeout, DNS, connection, TLS or cancellation.
+No request/response bodies or headers are added. Operation labels should be
+static and exclude credentials or customer data. Older servers safely accept
+this metadata; Logister 3.8 uses it in connected request and impact views.
+
+HttpURLConnection records `callback` duration through the supplied response-consumption block. OkHttp records `response_headers` duration for each instrumented network attempt; response-body reads and later failures are outside that span. DNS/connect failures before network interception produce one failure record. Automatic transport retries that never reach the network interceptor are not individually counted.
+
+Client and backend durations measure different work. Do not subtract them to
+estimate network time. A shared identifier establishes related evidence, not
+root cause; omitted fields mean the evidence was not captured.

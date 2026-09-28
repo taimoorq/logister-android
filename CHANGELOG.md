@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.1 - 2026-09-28
+
+- Record optional HTTP method, status code, failure category, attempt number and duration scope on traced calls for connected-project investigation.
+- Preserve application results, origin allowlists, request handles and compatibility with older Logister servers.
+- Capture DNS/connect failures before OkHttp network interception without duplicating an already recorded attempt.
+
 ## v0.6.0 - 2026-09-24
 
 - Configure CI, release, and dependency submission to install platform-tools explicitly; the removed legacy tools package must not block SDK setup.
