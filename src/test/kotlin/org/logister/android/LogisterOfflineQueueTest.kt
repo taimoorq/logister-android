@@ -103,6 +103,73 @@ class LogisterOfflineQueueTest {
     }
 
     @Test
+    fun enqueueNeverWaitsForAnInFlightDelivery() {
+        val store = InMemoryEnvelopeStore()
+        val queue = LogisterOfflineQueue(
+            store = store,
+            maxEvents = 10,
+            maxBytes = 16 * 1024,
+            maxAgeDays = 7,
+            nowMillis = { 1_000L },
+        )
+        assertTrue(queue.enqueue(envelope("slow")))
+        val sendStarted = CountDownLatch(1)
+        val releaseSend = CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+        val flush = executor.submit<Int> {
+            queue.flush { _ ->
+                sendStarted.countDown()
+                check(releaseSend.await(5, TimeUnit.SECONDS))
+                LogisterQueueDeliveryDecision.Accepted
+            }
+        }
+        assertTrue(sendStarted.await(1, TimeUnit.SECONDS))
+
+        val started = System.nanoTime()
+        assertTrue(queue.tryEnqueue(envelope("crash"), 250))
+        val elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
+        assertTrue("crash enqueue waited $elapsedMillis ms", elapsedMillis < 250)
+        assertEquals(0, queue.flush(waitForActiveFlush = false) { LogisterQueueDeliveryDecision.Accepted })
+        assertEquals(2, queue.size())
+
+        releaseSend.countDown()
+        // The active flush re-reads the head after each delivery, so it also sends the crash.
+        assertEquals(2, flush.get(5, TimeUnit.SECONDS))
+        assertEquals(0, queue.size())
+        executor.shutdownNow()
+    }
+
+    @Test
+    fun computedRetryBackoffIsJittered() {
+        var now = 1_000L
+        var fraction = 0.0
+        val queue = LogisterOfflineQueue(
+            store = InMemoryEnvelopeStore(),
+            maxEvents = 10,
+            maxBytes = 16 * 1024,
+            maxAgeDays = 7,
+            nowMillis = { now },
+            randomFraction = { fraction },
+        )
+        queue.enqueue(envelope("retry"))
+        val retry = { _: JSONObject -> LogisterQueueDeliveryDecision.Retry() }
+
+        // Attempts 1-3 have a 1, 2, and 4 second base: equal jitter waits half plus a random share.
+        assertEquals(0, queue.flush(sender = retry))
+        now += 1_000
+        assertEquals(0, queue.flush(sender = retry))
+        fraction = 1.0
+        now += 1_000
+        assertEquals(0, queue.flush(sender = retry))
+        now += 3_999
+        var sent = 0
+        queue.flush { sent += 1; LogisterQueueDeliveryDecision.Accepted }
+        assertEquals(0, sent)
+        now += 1
+        assertEquals(1, queue.flush { LogisterQueueDeliveryDecision.Accepted })
+    }
+
+    @Test
     fun storageOwnerSeparatesEndpointsPackagesAndExplicitLogicalClients() {
         val baseline = storageOwnerKey("https://logister.example/api", "com.acme.one", null, null)
         assertTrue(baseline != storageOwnerKey("https://other.example/api", "com.acme.one", null, null))

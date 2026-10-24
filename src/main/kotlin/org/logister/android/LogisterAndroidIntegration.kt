@@ -41,6 +41,8 @@ internal class LogisterAndroidIntegration(
     private var previousHandler: Thread.UncaughtExceptionHandler? = null
     private var installedHandler: LogisterUncaughtExceptionHandler? = null
     @Volatile private var attached: Boolean = false
+    @Volatile private var cachedInstallation: CachedInstallation? = null
+    private val installationLock = Any()
     private val processStartedAtMillis: Long = System.currentTimeMillis()
     private val processRunJournal = LogisterProcessRunJournal(
         java.io.File(application.noBackupFilesDir, "logister_process_runs_$storageNamespace.json"),
@@ -60,10 +62,13 @@ internal class LogisterAndroidIntegration(
         sessionStartedAtMillis = null
         currentScreen = null
         backgroundedAt = null
-        application.getSharedPreferences("logister_identity_$storageNamespace", Application.MODE_PRIVATE)
-            .edit()
-            .clear()
-            .commit()
+        synchronized(installationLock) {
+            cachedInstallation = null
+            application.getSharedPreferences("logister_identity_$storageNamespace", Application.MODE_PRIVATE)
+                .edit()
+                .clear()
+                .commit()
+        }
         application.getSharedPreferences("logister_exit_info_$storageNamespace", Application.MODE_PRIVATE)
             .edit()
             .clear()
@@ -80,20 +85,34 @@ internal class LogisterAndroidIntegration(
 
     fun installationIdHash(): String? {
         if (!installationTrackingEnabled) return null
-        val preferences = application.getSharedPreferences("logister_identity_$storageNamespace", Application.MODE_PRIVATE)
         val now = System.currentTimeMillis()
-        val createdAt = preferences.getLong("installation_created_at", 0L)
         val rotationMillis = TimeUnit.DAYS.toMillis(installationRotationDays.toLong())
-        var value = preferences.getString("installation_pseudonym", null)
-        if (value.isNullOrBlank() || createdAt <= 0L || now - createdAt >= rotationMillis) {
-            value = sha256(UUID.randomUUID().toString())
-            preferences.edit()
-                .putString("installation_pseudonym", value)
-                .putLong("installation_created_at", now)
-                .apply()
+        cachedInstallation?.let { cached ->
+            if (now - cached.createdAtMillis < rotationMillis) return cached.pseudonym
         }
-        return value
+        synchronized(installationLock) {
+            cachedInstallation?.let { cached ->
+                if (now - cached.createdAtMillis < rotationMillis) return cached.pseudonym
+            }
+            val preferences = application.getSharedPreferences("logister_identity_$storageNamespace", Application.MODE_PRIVATE)
+            val createdAt = preferences.getLong("installation_created_at", 0L)
+            val stored = preferences.getString("installation_pseudonym", null)
+            val current = if (stored.isNullOrBlank() || createdAt <= 0L || now - createdAt >= rotationMillis) {
+                val fresh = CachedInstallation(sha256(UUID.randomUUID().toString()), now)
+                preferences.edit()
+                    .putString("installation_pseudonym", fresh.pseudonym)
+                    .putLong("installation_created_at", fresh.createdAtMillis)
+                    .apply()
+                fresh
+            } else {
+                CachedInstallation(stored, createdAt)
+            }
+            cachedInstallation = current
+            return current.pseudonym
+        }
     }
+
+    private class CachedInstallation(val pseudonym: String, val createdAtMillis: Long)
 
     fun attach(client: LogisterClient) {
         if (attached) return
@@ -101,6 +120,8 @@ internal class LogisterAndroidIntegration(
         this.client = client
         application.registerActivityLifecycleCallbacks(this)
         if (automaticCrashCaptureEnabled) installExceptionHandler()
+        // Warm the installation pseudonym cache off the calling thread.
+        if (installationTrackingEnabled) client.runAsync { installationIdHash() }
         if (applicationExitCaptureEnabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             client.runAsync {
                 try {

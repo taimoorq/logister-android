@@ -1,8 +1,7 @@
 package org.logister.android
 
-import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
-import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
@@ -23,42 +22,50 @@ public class HttpUrlConnectionLogisterTransport : LogisterTransport {
     ): LogisterResponse {
         val payload = envelope.toString().toByteArray(StandardCharsets.UTF_8)
         val connection = URL(endpoint).openConnection() as HttpURLConnection
-        connection.requestMethod = "POST"
-        connection.connectTimeout = connectTimeoutMs
-        connection.readTimeout = readTimeoutMs
-        connection.doOutput = true
-        connection.setRequestProperty("Authorization", "Bearer $mobileIngestToken")
-        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-        connection.setRequestProperty("Accept", "application/json")
-        connection.setRequestProperty("User-Agent", "logister-android/$LOGISTER_ANDROID_SDK_VERSION")
+        try {
+            connection.requestMethod = "POST"
+            connection.connectTimeout = connectTimeoutMs
+            connection.readTimeout = readTimeoutMs
+            // A redirect would resend the bearer token to a host the app never configured.
+            connection.instanceFollowRedirects = false
+            connection.doOutput = true
+            connection.setFixedLengthStreamingMode(payload.size)
+            connection.setRequestProperty("Authorization", "Bearer $mobileIngestToken")
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            connection.setRequestProperty("Accept", "application/json")
+            connection.setRequestProperty("User-Agent", "logister-android/$LOGISTER_ANDROID_SDK_VERSION")
 
-        connection.outputStream.use { outputStream ->
-            outputStream.write(payload)
+            connection.outputStream.use { outputStream ->
+                outputStream.write(payload)
+            }
+
+            val statusCode = connection.responseCode
+            val retryAfterMillis = parseRetryAfter(connection.getHeaderField("Retry-After"))
+            val responseStream = if (statusCode >= 400) connection.errorStream else connection.inputStream
+            val body = readBody(responseStream)
+            return LogisterResponse.withRetryAfter(statusCode, body, retryAfterMillis)
+        } finally {
+            connection.disconnect()
         }
-
-        val statusCode = connection.responseCode
-        val retryAfterMillis = parseRetryAfter(connection.getHeaderField("Retry-After"))
-        val responseStream = if (statusCode >= 400) connection.errorStream else connection.inputStream
-        val body = readBody(responseStream)
-        connection.disconnect()
-        return LogisterResponse.withRetryAfter(statusCode, body, retryAfterMillis)
     }
 
+    /** Reads at most [MAX_RESPONSE_BODY_BYTES]; the SDK only needs short status bodies. */
     @Throws(Exception::class)
     private fun readBody(inputStream: InputStream?): String {
         if (inputStream == null) {
             return ""
         }
 
-        val body = StringBuilder()
-        BufferedReader(InputStreamReader(inputStream, StandardCharsets.UTF_8)).use { reader ->
-            var line = reader.readLine()
-            while (line != null) {
-                body.append(line)
-                line = reader.readLine()
+        val body = ByteArrayOutputStream()
+        inputStream.use { stream ->
+            val buffer = ByteArray(8 * 1_024)
+            while (body.size() < MAX_RESPONSE_BODY_BYTES) {
+                val read = stream.read(buffer, 0, minOf(buffer.size, MAX_RESPONSE_BODY_BYTES - body.size()))
+                if (read < 0) break
+                body.write(buffer, 0, read)
             }
         }
-        return body.toString()
+        return String(body.toByteArray(), StandardCharsets.UTF_8)
     }
 
     private fun parseRetryAfter(value: String?): Long? {
@@ -79,5 +86,6 @@ public class HttpUrlConnectionLogisterTransport : LogisterTransport {
 
     private companion object {
         const val MAX_RETRY_AFTER_MILLIS: Long = 24 * 60 * 60 * 1_000
+        const val MAX_RESPONSE_BODY_BYTES: Int = 64 * 1_024
     }
 }
