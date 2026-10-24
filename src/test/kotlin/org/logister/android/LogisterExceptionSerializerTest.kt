@@ -42,4 +42,34 @@ class LogisterExceptionSerializerTest {
         assertEquals("bad item", serialized.getJSONObject("cause").getString("message"))
         assertTrue(serialized.getJSONArray("stacktrace").length() <= 100)
     }
+
+    @Test
+    fun causesOmitFramesSharedWithTheEnclosingTraceAndTheChainIsBounded() {
+        val common = Array(90) { StackTraceElement("com.acme.Common", "frame$it", "Common.kt", it + 1) }
+        var throwable: Throwable = IllegalArgumentException("root")
+        throwable.stackTrace = unique("Root") + common
+        repeat(8) { level ->
+            throwable = IllegalStateException("level $level", throwable).apply {
+                stackTrace = unique("Level$level") + common
+            }
+        }
+
+        val serialized = LogisterExceptionSerializer.serialize(throwable, LogisterExceptionDataPolicy.FULL)
+
+        assertEquals(100, serialized.getJSONArray("stacktrace").length())
+        assertFalse(serialized.has("frames_in_common"))
+        val cause = serialized.getJSONObject("cause")
+        assertEquals(10, cause.getJSONArray("stacktrace").length())
+        assertEquals(90, cause.getInt("frames_in_common"))
+        var frames = 0
+        var current: org.json.JSONObject? = serialized
+        while (current != null) {
+            frames += current.getJSONArray("stacktrace").length()
+            current = current.optJSONObject("cause")
+        }
+        assertTrue(frames <= 150)
+    }
+
+    private fun unique(name: String): Array<StackTraceElement> =
+        Array(10) { StackTraceElement("com.acme.$name", "frame$it", "$name.kt", it + 1) }
 }

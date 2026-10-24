@@ -13,6 +13,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -107,8 +108,25 @@ public final class LogisterClientTest {
         assertEquals("error", event.getString("event_type"));
         assertEquals("error", event.getString("level"));
         assertEquals("java.lang.IllegalStateException", exception.getString("type"));
-        assertEquals("bad checkout", exception.getString("message"));
+        assertFalse(exception.has("message"));
+        assertEquals("java.lang.IllegalStateException", event.getString("message"));
+        assertEquals("type_and_stacktrace", context.getJSONObject("error").getString("data_policy"));
         assertNotNull(exception.getJSONArray("stacktrace"));
+    }
+
+    @Test
+    public void captureExceptionIncludesMessagesOnlyWithExplicitFullPolicy() throws Exception {
+        CapturingTransport transport = new CapturingTransport();
+        LogisterClient client = testClient(transport)
+                .exceptionDataPolicy(LogisterExceptionDataPolicy.FULL)
+                .build();
+
+        client.captureExceptionAsync(new IllegalStateException("bad checkout")).get();
+
+        JSONObject event = transport.envelope.getJSONObject("event");
+        JSONObject exception = event.getJSONObject("context").getJSONObject("exception");
+        assertEquals("java.lang.IllegalStateException: bad checkout", event.getString("message"));
+        assertEquals("bad checkout", exception.getString("message"));
     }
 
     @Test

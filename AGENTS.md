@@ -22,6 +22,18 @@ signing keys, private telemetry, customer data, or local Android configuration.
   publisher internals as dependencies of the shipped SDK; review build-tool
   advisories separately.
 
+## SDK safety rules
+
+- No exception from capture, envelope building, sanitization, `beforeSend`, or
+  delivery may escape into the host app. Asynchronous capture builds envelopes
+  on the executor and returns `LogisterResponse.dropped(...)` on failure; the
+  uncaught-exception path must always reach the previous handler.
+- Default redaction follows the spec shared by all Logister SDKs (README,
+  "Every payload is recursively redacted"). Keep `LogisterPayloadPolicy.kt`
+  identical to the other SDKs' key list, contains fragments, value patterns,
+  and URL handling; never apply it to SDK identity fields.
+- Never hold the offline queue's storage lock across network I/O.
+
 ## Verification
 
 Run with a configured Android SDK before handoff or release:

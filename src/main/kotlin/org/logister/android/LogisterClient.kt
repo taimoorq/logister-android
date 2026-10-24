@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import org.json.JSONArray
 import org.json.JSONObject
 
-internal const val LOGISTER_ANDROID_SDK_VERSION: String = "0.6.1"
+internal const val LOGISTER_ANDROID_SDK_VERSION: String = "0.7.0"
 
 /** Main Android client for sending telemetry to Logister. */
 public class LogisterClient private constructor(
@@ -42,7 +42,7 @@ public class LogisterClient private constructor(
     private val processPolicy: LogisterProcessPolicy,
     private val payloadPolicy: LogisterPayloadPolicy,
     private val beforeSend: LogisterBeforeSend?,
-    private val clientReports: Set<String>,
+    private val clientReports: MutableSet<String>,
     private val processEligible: Boolean,
     collectionEnabled: Boolean,
     breadcrumbCapacity: Int
@@ -58,6 +58,12 @@ public class LogisterClient private constructor(
     private val breadcrumbBuffer: LogisterBreadcrumbBuffer = LogisterBreadcrumbBuffer(breadcrumbCapacity)
     @Volatile private var androidIntegration: LogisterAndroidIntegration? = null
     @Volatile private var offlineQueue: LogisterOfflineQueue? = null
+    // Post-crash delivery must not wait behind ordinary work on the caller-supplied executor.
+    private val crashExecutor: ExecutorService by lazy {
+        Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "logister-crash-flush").apply { isDaemon = true }
+        }
+    }
 
     public fun captureAsync(event: LogisterEvent): Future<LogisterResponse> =
         captureAsync(event, LogisterEventOptions.EMPTY)
@@ -67,9 +73,16 @@ public class LogisterClient private constructor(
         options: LogisterEventOptions?
     ): Future<LogisterResponse> {
         if (!collectionEnabled) return completedResponse(LogisterResponse.collectionDisabled())
-        val envelope = buildEnvelope(event, options ?: LogisterEventOptions.EMPTY)
-            ?: return completedResponse(LogisterResponse.dropped("discarded by payload policy"))
-        return executor.submit<LogisterResponse> { deliver(envelope) }
+        val effectiveOptions = options ?: LogisterEventOptions.EMPTY
+        return try {
+            // Only volatile runtime state is read here; building, sanitizing, and preference I/O
+            // run on the executor so capture never throws into or blocks the calling thread.
+            val snapshot = runtimeSnapshot(event)
+            executor.submit<LogisterResponse> { buildAndDeliver(event, effectiveOptions, snapshot) }
+        } catch (error: Throwable) {
+            discardBeforeQueue("capture failed ${error.javaClass.simpleName}")
+            completedResponse(LogisterResponse.dropped("capture failed"))
+        }
     }
 
     @Throws(Exception::class)
@@ -79,13 +92,36 @@ public class LogisterClient private constructor(
     @Throws(Exception::class)
     public fun capture(event: LogisterEvent, options: LogisterEventOptions?): LogisterResponse {
         if (!collectionEnabled) return LogisterResponse.collectionDisabled()
-        val envelope = buildEnvelope(event, options ?: LogisterEventOptions.EMPTY)
-            ?: return LogisterResponse.dropped("discarded by payload policy")
+        return buildAndDeliver(event, options ?: LogisterEventOptions.EMPTY, runtimeSnapshot(event))
+    }
+
+    @Throws(Exception::class)
+    private fun buildAndDeliver(
+        event: LogisterEvent,
+        options: LogisterEventOptions,
+        snapshot: RuntimeSnapshot,
+    ): LogisterResponse {
+        val envelope = try {
+            buildEnvelope(event, options, snapshot)
+        } catch (error: Throwable) {
+            discardBeforeQueue("envelope build failed ${error.javaClass.simpleName}")
+            return LogisterResponse.dropped("envelope build failed")
+        } ?: return LogisterResponse.dropped("discarded by payload policy")
         return deliver(envelope)
     }
 
     internal fun runAsync(block: () -> Unit) {
-        executor.submit(block)
+        try {
+            executor.submit {
+                try {
+                    block()
+                } catch (_: Throwable) {
+                    // Background integration work must never surface in the host app.
+                }
+            }
+        } catch (_: Exception) {
+            // A shut-down executor means the client is no longer delivering.
+        }
     }
 
     private fun completedResponse(response: LogisterResponse): Future<LogisterResponse> =
@@ -100,20 +136,33 @@ public class LogisterClient private constructor(
 
     public fun discardedEventCount(): Int = discardedBeforeQueue.get() + (offlineQueue?.discardedCount() ?: 0)
 
-    public fun flushQueuedEventsAsync(): Future<Int> = executor.submit<Int> { flushQueuedEvents() }
+    public fun flushQueuedEventsAsync(): Future<Int> = try {
+        executor.submit<Int> { flushQueuedEvents() }
+    } catch (_: Exception) {
+        java.util.concurrent.FutureTask<Int> { 0 }.also { it.run() }
+    }
 
     @Throws(Exception::class)
-    public fun flushQueuedEvents(): Int {
+    public fun flushQueuedEvents(): Int = flushQueuedEvents(waitForActiveFlush = true)
+
+    private fun flushQueuedEvents(waitForActiveFlush: Boolean): Int {
         if (!collectionEnabled) return 0
         val queue = offlineQueue ?: return 0
-        return queue.flush { queuedEnvelope ->
-            try {
-                classifyForQueue(sendWithAuthentication(queuedEnvelope))
-            } catch (error: Exception) {
-                recordDeliveryError(error)
-                LogisterQueueDeliveryDecision.Retry()
-            }
+        return queue.flush(waitForActiveFlush = waitForActiveFlush, sender = ::sendQueued)
+    }
+
+    private fun sendQueued(queuedEnvelope: JSONObject): LogisterQueueDeliveryDecision {
+        if (!collectionEnabled) return LogisterQueueDeliveryDecision.Retry()
+        return try {
+            classifyForQueue(sendWithAuthentication(queuedEnvelope))
+        } catch (error: Exception) {
+            recordDeliveryError(error)
+            LogisterQueueDeliveryDecision.Retry()
         }
+    }
+
+    internal fun addClientReport(report: String) {
+        clientReports.add(report)
     }
 
     public fun clearQueuedEvents(): Boolean = offlineQueue?.clear() ?: true
@@ -147,7 +196,7 @@ public class LogisterClient private constructor(
         processName = processName,
         processPolicy = processPolicy,
         crashHandlerInstalled = androidIntegration?.crashHandlerInstalled == true,
-        clientReports = clientReports,
+        clientReports = synchronized(clientReports) { clientReports.toSet() },
     )
 
     /** Detaches lifecycle and crash hooks. Queued envelopes remain available for a later client. */
@@ -176,14 +225,7 @@ public class LogisterClient private constructor(
     @Throws(Exception::class)
     private fun deliver(envelope: JSONObject): LogisterResponse {
         if (!collectionEnabled) return LogisterResponse.collectionDisabled()
-        offlineQueue?.flush { queuedEnvelope ->
-            try {
-                classifyForQueue(sendWithAuthentication(queuedEnvelope))
-            } catch (error: Exception) {
-                recordDeliveryError(error)
-                LogisterQueueDeliveryDecision.Retry()
-            }
-        }
+        offlineQueue?.flush(sender = ::sendQueued)
 
         return try {
             val response = sendWithAuthentication(envelope)
@@ -284,46 +326,58 @@ public class LogisterClient private constructor(
 
     internal fun captureUncaughtException(thread: Thread, throwable: Throwable) {
         if (!collectionEnabled) return
-        val event = exceptionEvent(
-            throwable = throwable,
-            policy = automaticCrashExceptionDataPolicy,
-            captureSource = CAPTURE_SOURCE_AUTOMATIC,
-            threadName = boundedThreadName(thread.name),
-        )
-        val options = LogisterEventOptions.builder()
-            .mechanism("unhandled_exception")
-            .handled(false)
-            .build()
-        val envelope = buildEnvelope(event, options) ?: return
-        if (offlineQueue?.tryEnqueue(envelope, CRASH_QUEUE_LOCK_TIMEOUT_MILLIS) == true) {
-            executor.submit {
-                try {
-                    flushQueuedEvents()
-                } catch (_: Exception) {
-                    // The durable envelope remains queued for a later authenticated flush.
-                }
-            }
-            return
-        }
+        val envelope = try {
+            val event = exceptionEvent(
+                throwable = throwable,
+                policy = automaticCrashExceptionDataPolicy,
+                captureSource = CAPTURE_SOURCE_AUTOMATIC,
+                threadName = boundedThreadName(thread.name),
+            )
+            val options = LogisterEventOptions.builder()
+                .mechanism("unhandled_exception")
+                .handled(false)
+                .build()
+            buildEnvelope(event, options, runtimeSnapshot(event))
+        } catch (_: Throwable) {
+            null
+        } ?: return
 
+        // The queue's persistence lock is never held across network I/O, so this only waits for
+        // another short disk write, never for a slow in-flight delivery.
+        val persisted = try {
+            offlineQueue?.tryEnqueue(envelope, CRASH_QUEUE_LOCK_TIMEOUT_MILLIS) == true
+        } catch (_: Throwable) {
+            false
+        }
         try {
-            captureAsync(event, options).get(CRASH_DELIVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-        } catch (_: Exception) {
-            // The existing uncaught-exception handler must always continue.
+            val delivery = crashExecutor.submit(
+                java.util.concurrent.Callable {
+                    if (persisted) {
+                        flushQueuedEvents(waitForActiveFlush = false)
+                    } else {
+                        sendWithAuthentication(envelope)
+                    }
+                },
+            )
+            if (!persisted) delivery.get(CRASH_DELIVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        } catch (_: Throwable) {
+            // The durable envelope remains queued for a later authenticated flush, and the
+            // existing uncaught-exception handler must always continue.
         }
     }
 
     internal fun persistHistoricalEvent(event: LogisterEvent): Boolean {
         if (!collectionEnabled) return false
-        val envelope = buildEnvelope(event, LogisterEventOptions.EMPTY) ?: return false
+        val envelope = try {
+            buildEnvelope(event, LogisterEventOptions.EMPTY, RuntimeSnapshot.HISTORICAL)
+        } catch (error: Throwable) {
+            discardBeforeQueue("envelope build failed ${error.javaClass.simpleName}")
+        } ?: return false
         val queued = offlineQueue?.tryEnqueue(envelope, HISTORICAL_QUEUE_LOCK_TIMEOUT_MILLIS) == true
         if (queued) {
-            executor.submit {
-                try {
-                    flushQueuedEvents()
-                } catch (_: Exception) {
-                    // The source checkpoint advances only after the envelope is durable.
-                }
+            runAsync {
+                // The source checkpoint advances only after the envelope is durable.
+                flushQueuedEvents()
             }
         }
         return queued
@@ -403,8 +457,42 @@ public class LogisterClient private constructor(
         return captureAsync(event, options)
     }
 
+    /** Captures the volatile runtime state that must reflect the moment of capture. */
+    private fun runtimeSnapshot(event: LogisterEvent): RuntimeSnapshot {
+        if (event.context[CAPTURE_SOURCE_CONTEXT_KEY] == CAPTURE_SOURCE_HISTORICAL) return RuntimeSnapshot.HISTORICAL
+        val runtime = androidIntegration
+        return RuntimeSnapshot(
+            capturedAtMillis = System.currentTimeMillis(),
+            integration = runtime,
+            sessionId = runtime?.currentSessionId(),
+            sessionStartedAt = runtime?.currentSessionStartedAt(),
+            screenName = runtime?.currentScreen(),
+            inForeground = runtime?.inForeground,
+            breadcrumbs = breadcrumbBuffer.snapshot(),
+        )
+    }
+
+    private class RuntimeSnapshot(
+        val capturedAtMillis: Long,
+        val integration: LogisterAndroidIntegration?,
+        val sessionId: String?,
+        val sessionStartedAt: String?,
+        val screenName: String?,
+        val inForeground: Boolean?,
+        val breadcrumbs: List<Map<String, Any>>,
+    ) {
+        companion object {
+            val HISTORICAL: RuntimeSnapshot
+                get() = RuntimeSnapshot(System.currentTimeMillis(), null, null, null, null, null, emptyList())
+        }
+    }
+
     @Throws(Exception::class)
-    private fun buildEventPayload(event: LogisterEvent, options: LogisterEventOptions): JSONObject {
+    private fun buildEventPayload(
+        event: LogisterEvent,
+        options: LogisterEventOptions,
+        snapshot: RuntimeSnapshot,
+    ): JSONObject {
         val payload = event.toJson()
         val context = baseContext()
         context.putAll(event.context)
@@ -422,7 +510,7 @@ public class LogisterClient private constructor(
         }
 
         if (!payload.has("uuid")) payload.put("uuid", UUID.randomUUID().toString())
-        val capturedAt = firstPresent(options.occurredAt, event.occurredAt) ?: iso8601(System.currentTimeMillis())
+        val capturedAt = firstPresent(options.occurredAt, event.occurredAt) ?: iso8601(snapshot.capturedAtMillis)
         payload.put("occurred_at", capturedAt)
 
         LogisterEvent.putIfPresent(payload, "level", firstPresent(options.level, event.level))
@@ -451,15 +539,15 @@ public class LogisterClient private constructor(
         putContext(context, "transaction_name", options.transactionName)
         putContext(context, "duration_ms", options.durationMs)
 
-        val runtime = if (historical) null else androidIntegration
-        val sessionId = firstPresent(options.sessionId, runtime?.currentSessionId())
+        val runtime = if (historical) null else snapshot.integration
+        val sessionId = firstPresent(options.sessionId, snapshot.sessionId.takeIf { !historical })
         val sessionStartedAt = if (options.sessionId != null) {
             options.sessionStartedAt
         } else {
-            runtime?.currentSessionStartedAt()
+            snapshot.sessionStartedAt.takeIf { !historical }
         }
-        val screenName = firstPresent(options.screenName, runtime?.currentScreen())
-        val inForeground = options.inForeground ?: runtime?.inForeground
+        val screenName = firstPresent(options.screenName, snapshot.screenName.takeIf { !historical })
+        val inForeground = options.inForeground ?: snapshot.inForeground.takeIf { !historical }
         val installationIdHash = runtime?.installationIdHash()
         putContext(context, "session_id", sessionId)
         putContext(context, "screen_name", screenName)
@@ -506,7 +594,7 @@ public class LogisterClient private constructor(
             if (error.length() > 0) context["error"] = error
         }
 
-        val breadcrumbs = if (historical) emptyList() else breadcrumbBuffer.snapshot()
+        val breadcrumbs = if (historical) emptyList() else snapshot.breadcrumbs
         if (breadcrumbs.isNotEmpty()) context["breadcrumbs"] = JSONArray(breadcrumbs)
 
         payload.put("context", JSONObject(context))
@@ -517,14 +605,15 @@ public class LogisterClient private constructor(
     private fun buildEnvelope(
         event: LogisterEvent,
         options: LogisterEventOptions,
+        snapshot: RuntimeSnapshot,
     ): JSONObject? {
         val sanitized = sanitizeEnvelope(
-            JSONObject().put("event", buildEventPayload(event, options)),
+            JSONObject().put("event", buildEventPayload(event, options, snapshot)),
             payloadPolicy,
         ) ?: return discardBeforeQueue("payload budget exceeded")
         val processed = try {
             beforeSend?.process(JSONObject(sanitized.toString())) ?: sanitized.takeIf { beforeSend == null }
-        } catch (error: Exception) {
+        } catch (error: Throwable) {
             recordDeliveryError("beforeSend ${error.javaClass.simpleName}")
             null
         } ?: return discardBeforeQueue("beforeSend discarded event")
@@ -532,13 +621,14 @@ public class LogisterClient private constructor(
             ?: return discardBeforeQueue("payload policy removed event")
         val processedEvent = processed.optJSONObject("event")
             ?: return discardBeforeQueue("beforeSend removed event")
-        processedEvent.put("uuid", immutableEvent.getString("uuid"))
-        if (immutableEvent.has("occurred_at")) {
-            processedEvent.put("occurred_at", immutableEvent.getString("occurred_at"))
-        } else {
-            processedEvent.remove("occurred_at")
-        }
-        processedEvent.put("evidence", JSONObject(immutableEvent.getJSONObject("evidence").toString()))
+        val uuid = immutableEvent.optString("uuid").takeIf { it.isNotBlank() }
+            ?: return discardBeforeQueue("payload policy removed event identity")
+        val evidence = immutableEvent.optJSONObject("evidence")
+            ?: return discardBeforeQueue("payload policy removed event evidence")
+        processedEvent.put("uuid", uuid)
+        val occurredAt = immutableEvent.optString("occurred_at").takeIf { it.isNotBlank() }
+        if (occurredAt != null) processedEvent.put("occurred_at", occurredAt) else processedEvent.remove("occurred_at")
+        processedEvent.put("evidence", JSONObject(evidence.toString()))
         if (processedEvent.optString("event_type").isBlank() || processedEvent.optString("message").isBlank()) {
             return discardBeforeQueue("beforeSend removed required event fields")
         }
@@ -700,7 +790,7 @@ public class LogisterClient private constructor(
         private var offlineQueueMaxBytes: Int = 512 * 1024
         private var offlineQueueMaxAgeDays: Int = 7
         private var storageNamespace: String? = null
-        private var exceptionDataPolicy: LogisterExceptionDataPolicy = LogisterExceptionDataPolicy.FULL
+        private var exceptionDataPolicy: LogisterExceptionDataPolicy = LogisterExceptionDataPolicy.TYPE_AND_STACKTRACE
         private var automaticCrashExceptionDataPolicy: LogisterExceptionDataPolicy =
             LogisterExceptionDataPolicy.TYPE_AND_STACKTRACE
         private var collectionEnabled: Boolean = true
@@ -708,6 +798,7 @@ public class LogisterClient private constructor(
         private val allowedProcesses: MutableSet<String> = linkedSetOf()
         private var payloadPolicy: LogisterPayloadPolicy = LogisterPayloadPolicy.DEFAULT
         private var beforeSend: LogisterBeforeSend? = null
+        private var allowInsecureHttp: Boolean = false
 
         public fun environment(environment: String?): Builder = apply {
             this.environment = environment
@@ -813,6 +904,15 @@ public class LogisterClient private constructor(
             this.beforeSend = beforeSend
         }
 
+        /**
+         * Allows a plain `http://` endpoint on a non-loopback host. Use only for debug builds:
+         * the mobile ingest token and telemetry are otherwise sent unencrypted. Loopback hosts
+         * and the Android emulator host `10.0.2.2` are always allowed.
+         */
+        public fun allowInsecureHttp(allowInsecureHttp: Boolean): Builder = apply {
+            this.allowInsecureHttp = allowInsecureHttp
+        }
+
         public fun sessionTracking(enabled: Boolean): Builder = apply {
             sessionTrackingEnabled = enabled
         }
@@ -833,7 +933,11 @@ public class LogisterClient private constructor(
             automaticCrashExceptionDataPolicy = exceptionDataPolicy
         }
 
-        /** Sets the policy used by manual captureException calls. */
+        /**
+         * Sets the policy used by manual captureException calls. The default is
+         * [LogisterExceptionDataPolicy.TYPE_AND_STACKTRACE]; choose FULL only when exception
+         * messages and causes are known not to carry personal data or secrets.
+         */
         public fun exceptionDataPolicy(exceptionDataPolicy: LogisterExceptionDataPolicy): Builder = apply {
             this.exceptionDataPolicy = exceptionDataPolicy
         }
@@ -891,6 +995,9 @@ public class LogisterClient private constructor(
             require(!(automaticCrashCaptureEnabled || applicationExitCaptureEnabled) || offlineQueueEnabled) {
                 "automatic crash and application-exit capture require the durable offline queue"
             }
+            require(isPermittedEndpoint(endpoint, allowInsecureHttp)) {
+                "endpoint must use https unless it targets a loopback or emulator host, or allowInsecureHttp(true) is set"
+            }
 
             val app = application
             val packageInfo = app?.let(::packageInfo)
@@ -901,7 +1008,6 @@ public class LogisterClient private constructor(
                 .takeIf { it.size == 3 }
                 ?.let { "${it[0]}@${it[1]}+${it[2]}" }
             val effectiveProcessName = app?.let(::currentProcessName)
-            val discardedLegacyState = app?.let(::discardUnscopedLegacyState) == true
             val processAllowed = when (processPolicy) {
                 LogisterProcessPolicy.MAIN_ONLY -> app == null || effectiveProcessName == app.packageName
                 LogisterProcessPolicy.CURRENT_PROCESS -> true
@@ -943,10 +1049,8 @@ public class LogisterClient private constructor(
                 if (automaticCrashCaptureEnabled) add("automatic_crash_capture")
                 if (applicationExitCaptureEnabled) add("application_exit_capture")
             }
-            val clientReports = buildSet {
-                if (discardedLegacyState) add("legacy_unscoped_state_discarded")
-                if (!processAllowed) add("process_not_allowed")
-            }
+            val clientReports = java.util.Collections.synchronizedSet(LinkedHashSet<String>())
+            if (!processAllowed) clientReports.add("process_not_allowed")
 
             val client = LogisterClient(
                 tokenProvider = tokenProvider,
@@ -980,6 +1084,12 @@ public class LogisterClient private constructor(
                 collectionEnabled = collectionEnabled && processAllowed,
                 breadcrumbCapacity = breadcrumbCapacity
             )
+            if (app != null) {
+                // Legacy preference cleanup commits to disk, so keep it off the thread calling build().
+                client.runAsync {
+                    if (discardUnscopedLegacyState(app)) client.addClientReport("legacy_unscoped_state_discarded")
+                }
+            }
             if (app != null && processAllowed) {
                 if (offlineQueueEnabled) {
                     client.attachOfflineQueue(
@@ -1114,6 +1224,22 @@ private fun firstPresent(first: String?, second: String?): String? {
         return first
     }
     return if (second.isNullOrEmpty()) null else second
+}
+
+internal fun isPermittedEndpoint(endpoint: String, allowInsecureHttp: Boolean): Boolean {
+    val uri = try {
+        java.net.URI(endpoint)
+    } catch (_: Exception) {
+        return false
+    }
+    val host = uri.host?.lowercase(java.util.Locale.US)?.removePrefix("[")?.removeSuffix("]") ?: return false
+    return when (uri.scheme?.lowercase(java.util.Locale.US)) {
+        "https" -> true
+        "http" -> allowInsecureHttp || host == "localhost" || host.endsWith(".localhost") ||
+            host == "::1" || host == "0:0:0:0:0:0:0:1" || host == "10.0.2.2" ||
+            Regex("127(\\.\\d{1,3}){3}").matches(host)
+        else -> false
+    }
 }
 
 private fun requireValue(name: String, value: String?): String {

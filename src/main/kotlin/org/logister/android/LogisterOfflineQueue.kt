@@ -4,6 +4,7 @@ import android.content.Context
 import java.io.File
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -14,6 +15,7 @@ internal class LogisterOfflineQueue internal constructor(
     private val maxBytes: Int,
     maxAgeDays: Int,
     private val nowMillis: () -> Long = System::currentTimeMillis,
+    private val randomFraction: () -> Double = { ThreadLocalRandom.current().nextDouble() },
 ) {
     constructor(
         context: Context,
@@ -29,24 +31,29 @@ internal class LogisterOfflineQueue internal constructor(
     )
 
     private val maxAgeMillis = TimeUnit.DAYS.toMillis(maxAgeDays.toLong())
-    private val lock = ReentrantLock()
+    // Guards each short read-modify-write of the store. It is never held across delivery, so an
+    // enqueue (including the crash path) never waits on the network.
+    private val storeLock = ReentrantLock()
+    // Serializes flushes so one envelope is never sent by two flushers at once.
+    private val flushLock = ReentrantLock()
     @Volatile private var discardedEvents: Int = 0
 
-    fun enqueue(envelope: JSONObject, initialDelayMillis: Long? = null): Boolean = lock.withLock {
-        enqueueUnlocked(envelope, initialDelayMillis)
+    fun enqueue(envelope: JSONObject, initialDelayMillis: Long? = null): Boolean {
+        val serialized = envelope.toString()
+        return storeLock.withLock { enqueueUnlocked(serialized, initialDelayMillis) }
     }
 
     fun tryEnqueue(envelope: JSONObject, timeoutMillis: Long): Boolean {
-        if (!lock.tryLock(timeoutMillis, TimeUnit.MILLISECONDS)) return false
+        val serialized = envelope.toString()
+        if (!storeLock.tryLock(timeoutMillis, TimeUnit.MILLISECONDS)) return false
         return try {
-            enqueueUnlocked(envelope, initialDelayMillis = null)
+            enqueueUnlocked(serialized, initialDelayMillis = null)
         } finally {
-            lock.unlock()
+            storeLock.unlock()
         }
     }
 
-    private fun enqueueUnlocked(envelope: JSONObject, initialDelayMillis: Long?): Boolean {
-        val serialized = envelope.toString()
+    private fun enqueueUnlocked(serialized: String, initialDelayMillis: Long?): Boolean {
         if (serialized.byteSize() > maxBytes) return false
 
         val entries = activeEntries(countExpiredAsDiscarded = true).toMutableList()
@@ -68,61 +75,99 @@ internal class LogisterOfflineQueue internal constructor(
         return writeEntries(entries)
     }
 
+    /**
+     * Delivers due envelopes oldest first. The store lock is taken only to read the head and to
+     * record its outcome, so concurrent enqueues proceed while [sender] performs network I/O.
+     * With [waitForActiveFlush] false, returns 0 at once when another flush is running; that flush
+     * re-reads the head after each delivery and so also picks up newly queued envelopes.
+     */
     fun flush(
         limit: Int = 10,
+        waitForActiveFlush: Boolean = true,
         sender: (JSONObject) -> LogisterQueueDeliveryDecision,
-    ): Int = lock.withLock {
-        val entries = activeEntries(countExpiredAsDiscarded = true).toMutableList()
-        var delivered = 0
-        while (entries.isNotEmpty() && delivered < limit) {
-            if (entries.first().nextAttemptAtMillis > nowMillis()) break
-            val envelope = try {
-                JSONObject(entries.first().envelope)
-            } catch (_: Exception) {
-                entries.removeAt(0)
-                discardedEvents += 1
-                continue
+    ): Int {
+        if (waitForActiveFlush) flushLock.lock() else if (!flushLock.tryLock()) return 0
+        try {
+            var delivered = 0
+            val attempted = mutableListOf<QueuedEnvelope>()
+            while (delivered < limit) {
+                val head = storeLock.withLock { prunedEntries().firstOrNull() } ?: break
+                // A failed store write leaves the head in place; never resend it in this flush.
+                if (head.nextAttemptAtMillis > nowMillis() || head in attempted) break
+                attempted += head
+                val envelope = try {
+                    JSONObject(head.envelope)
+                } catch (_: Exception) {
+                    storeLock.withLock {
+                        replaceEntry(head, replacement = null)
+                        discardedEvents += 1
+                    }
+                    continue
+                }
+                val decision = sender(envelope)
+                storeLock.withLock {
+                    when (decision) {
+                        LogisterQueueDeliveryDecision.Accepted -> {
+                            replaceEntry(head, replacement = null)
+                            delivered += 1
+                        }
+                        LogisterQueueDeliveryDecision.Discard -> {
+                            if (replaceEntry(head, replacement = null)) discardedEvents += 1
+                        }
+                        is LogisterQueueDeliveryDecision.Retry -> {
+                            val attempt = head.attemptCount + 1
+                            replaceEntry(
+                                head,
+                                head.copy(
+                                    attemptCount = attempt,
+                                    nextAttemptAtMillis = nowMillis() + (
+                                        decision.afterMillis ?: retryDelayMillis(attempt)
+                                    ).coerceIn(MIN_RETRY_MILLIS, MAX_RETRY_MILLIS),
+                                ),
+                            )
+                        }
+                    }
+                }
+                if (decision is LogisterQueueDeliveryDecision.Retry) break
             }
-            when (val decision = sender(envelope)) {
-                LogisterQueueDeliveryDecision.Accepted -> {
-                    entries.removeAt(0)
-                    delivered += 1
-                }
-                LogisterQueueDeliveryDecision.Discard -> {
-                    entries.removeAt(0)
-                    discardedEvents += 1
-                }
-                is LogisterQueueDeliveryDecision.Retry -> {
-                    val current = entries.removeAt(0)
-                    val attempt = current.attemptCount + 1
-                    entries.add(
-                        0,
-                        current.copy(
-                            attemptCount = attempt,
-                            nextAttemptAtMillis = nowMillis() + (
-                                decision.afterMillis ?: retryDelayMillis(attempt)
-                            ).coerceIn(MIN_RETRY_MILLIS, MAX_RETRY_MILLIS),
-                        ),
-                    )
-                    break
-                }
-            }
+            return delivered
+        } finally {
+            flushLock.unlock()
         }
-        writeEntries(entries)
-        delivered
     }
 
-    fun size(): Int = lock.withLock {
+    /** Must hold [storeLock]. Returns false when the entry was evicted, removed, or cleared meanwhile. */
+    private fun replaceEntry(original: QueuedEnvelope, replacement: QueuedEnvelope?): Boolean {
+        val entries = activeEntries(countExpiredAsDiscarded = true).toMutableList()
+        val index = entries.indexOf(original)
+        if (index < 0) {
+            writeEntries(entries)
+            return false
+        }
+        if (replacement == null) entries.removeAt(index) else entries[index] = replacement
+        writeEntries(entries)
+        return true
+    }
+
+    /** Must hold [storeLock]. Persists the removal of expired or unreadable entries it counted. */
+    private fun prunedEntries(): List<QueuedEnvelope> {
+        val discardedBefore = discardedEvents
+        val entries = activeEntries(countExpiredAsDiscarded = true)
+        if (discardedEvents != discardedBefore) writeEntries(entries)
+        return entries
+    }
+
+    fun size(): Int = storeLock.withLock {
         val entries = activeEntries(countExpiredAsDiscarded = true)
         writeEntries(entries)
         entries.size
     }
 
-    fun clear(): Boolean = lock.withLock { store.clear() }
+    fun clear(): Boolean = storeLock.withLock { store.clear() }
 
     fun discardedCount(): Int = discardedEvents
 
-    fun removeIf(predicate: (JSONObject) -> Boolean): Int = lock.withLock {
+    fun removeIf(predicate: (JSONObject) -> Boolean): Int = storeLock.withLock {
         val entries = activeEntries(countExpiredAsDiscarded = true)
         val retained = entries.filterNot { entry ->
             try {
@@ -200,10 +245,12 @@ internal class LogisterOfflineQueue internal constructor(
         val nextAttemptAtMillis: Long = 0L,
     )
 
+    /** Exponential backoff with equal jitter: half the capped delay plus a random share of the rest. */
     private fun retryDelayMillis(attempt: Int): Long {
         val exponent = (attempt - 1).coerceIn(0, 10)
-        val base = MIN_RETRY_MILLIS * (1L shl exponent)
-        return base.coerceAtMost(MAX_RETRY_MILLIS)
+        val base = (MIN_RETRY_MILLIS * (1L shl exponent)).coerceAtMost(MAX_RETRY_MILLIS)
+        val jitter = (base / 2 * randomFraction().coerceIn(0.0, 1.0)).toLong()
+        return base / 2 + jitter
     }
 
     private companion object {
@@ -271,12 +318,7 @@ private class AtomicFileLogisterEnvelopeStore(
 }
 
 private fun scopedEnvelopeStore(context: Context, ownerKey: String): LogisterEnvelopeStore {
-    // 0.3 used one Auto Backup-eligible global preference with no endpoint or project owner.
-    // Its tenant cannot be proven, so upgrade discards it instead of risking cross-project delivery.
-    context.getSharedPreferences("logister_delivery", Context.MODE_PRIVATE)
-        .edit()
-        .remove("offline_envelopes")
-        .commit()
+    // 0.3's unowned global preference queue is discarded off the main thread by the client builder.
     return AtomicFileLogisterEnvelopeStore(
         File(context.noBackupFilesDir, "logister_delivery_$ownerKey.json"),
     )
