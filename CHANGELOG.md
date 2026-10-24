@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.7.0 - 2026-10-23
+
+Security and reliability hardening. Review the default changes before upgrading.
+
+- Fixed a crash in the host app: a context with more keys than the item budget dropped the event UUID and evidence, and envelope building then threw `JSONException` on the calling thread. Envelope and event fields are now exempt from the item budget, `context` and each of its entries have their own budgets, truncation is marked with `context._truncated`, and oversized envelopes are reduced instead of dropped.
+- Capture never throws into the host app. Asynchronous capture builds and sanitizes the envelope on the client executor; build failures, throwing `beforeSend` hooks, and a shut-down executor return a dropped response. Non-finite numbers no longer fail an event.
+- Fixed lost crash reports on slow networks: the offline queue no longer holds its storage lock during delivery, so a crash envelope is persisted immediately, and the post-crash flush runs on a dedicated thread.
+- Adopted the shared Logister redaction spec. Keys are matched after removing all non-alphanumeric characters, with contains-matching on `token`, `secret`, `password`, `passwd`, `apikey`, `authorization`, `credential`, and `cookie`, so `accessToken`, `apiKey`, `x-api-key`, `refreshToken`, `clientSecret`, and `idToken` are now redacted. Sensitive values are replaced with `[REDACTED]` instead of the key being removed. Strings are also scrubbed for `Basic` credentials, JWTs, and `lgst_` keys.
+- Behavior change: URLs found in strings now keep non-sensitive query parameters and redact only sensitive values and userinfo, matching the other SDKs. Previously the whole query string was removed.
+- Default change: manual `captureException` now uses `TYPE_AND_STACKTRACE`. Set `exceptionDataPolicy(LogisterExceptionDataPolicy.FULL)` to keep messages and causes.
+- Default change: `build()` rejects plain `http` endpoints unless the host is loopback or `10.0.2.2`, or `allowInsecureHttp(true)` is set.
+- The default transport no longer follows redirects and caps response bodies at 64 KiB.
+- Computed retry backoff now uses equal jitter. `Retry-After` is still honored exactly.
+- Exception cause chains omit frames shared with the enclosing exception (`frames_in_common`) and are capped at 150 frames.
+- The installation pseudonym is cached in memory, and legacy-state cleanup no longer commits preferences on the thread calling `build()`.
+
 ## v0.6.1 - 2026-09-28
 
 - Record optional HTTP method, status code, failure category, attempt number and duration scope on traced calls for connected-project investigation.

@@ -34,7 +34,7 @@ Install the Android SDK from Maven Central:
 
 ```kotlin
 dependencies {
-    implementation("org.logister:logister-android:0.6.1")
+    implementation("org.logister:logister-android:0.7.0")
 }
 ```
 
@@ -165,11 +165,24 @@ Collection is enabled by default for compatibility. Call `setCollectionEnabled(f
 
 The default `MAIN_ONLY` process policy initializes automatic behavior only in the app's main process. Use `processPolicy(LogisterProcessPolicy.CURRENT_PROCESS)` for an explicitly configured process-local client, or `ALLOWLIST` with `allowedProcesses(...)`; non-main scopes include the process name in their storage key.
 
-Every payload is recursively scrubbed for common credential keys, Bearer values, and URL query/fragment data and is subject to bounded depth, item, string, and byte limits. Customize deterministic limits and keys with `payloadPolicy(...)`. A synchronous `beforeSend(...)` hook may further redact or discard an envelope, but it should never perform network or disk I/O and cannot replace the SDK-owned UUID, occurrence time, or evidence provenance.
+Every payload is recursively redacted before persistence or delivery, using the default redaction spec shared by all Logister SDKs:
 
-Automatic crash capture uses `TYPE_AND_STACKTRACE` by default. It omits throwable messages and cause chains, records the bounded actual crashing-thread name with the `crashed` role, persists the envelope before Android's previous uncaught-exception handler runs, and requires the durable offline queue. Manual `captureException` calls retain the 0.2.x full-detail policy unless the app sets `exceptionDataPolicy(TYPE_AND_STACKTRACE)` as shown above.
+- A key is sensitive when, after lowercasing and removing every non-alphanumeric character, it equals `password`, `passwd`, `pwd`, `secret`, `token`, `apikey`, `authorization`, `proxyauthorization`, `cookie`, `setcookie`, `sessiontoken`, `sessionkey`, `credential`, `credentials`, `privatekey`, `clientsecret`, `accesstoken`, `refreshtoken`, `idtoken`, `authtoken`, `xapikey`, `xauthtoken`, `xaccesstoken`, `xcsrftoken`, `xxsrftoken`, `signature`, `ssn`, `creditcard`, `cardnumber`, or `cvv`, or contains `token`, `secret`, `password`, `passwd`, `apikey`, `authorization`, `credential`, or `cookie`. So `accessToken`, `x-api-key`, and `client_secret` all match. The value becomes `"[REDACTED]"`; the key is kept.
+- String values are scrubbed for `Bearer <credential>` and `Basic <credential>`, JWT-shaped values, and `lgst_` keys.
+- URLs in strings keep their scheme, host, and path; userinfo and the value of any sensitive query parameter become `[REDACTED]` (other parameters are kept) and fragments are dropped.
+- This applies to context, breadcrumbs, exception data, span attributes, and messages. The SDK's own identity fields (`uuid`, `event_type`, `occurred_at`, trace, span, request, and session ids) are never rewritten.
 
-The offline queue stores at most the configured event and byte limits in an atomic app-private file under `noBackupFilesDir` and expires old entries after `maxAgeDays`. It is scoped by endpoint, application/service, optional `storageNamespace`, and process policy; tokens are never stored. Token-provider failures and retryable `408`, `425`, `429`, and `5xx` responses are queued with bounded backoff and `Retry-After`; a permanent client rejection is discarded so it cannot block later events. A queued response has `isQueued == true` and `isAccepted == false`; it only becomes accepted after a later server response succeeds. Call `flushQueuedEventsAsync()` after authentication when the app may not immediately emit another event. Call `clearSessionBoundQueuedEvents()` on logout or account replacement; it removes events containing either `session_id` or `user_id` while retaining anonymous automatic crashes. `clearQueuedEvents()` removes everything. Because the 0.3 queue and installation pseudonym had no provable client owner, 0.4 discards that ambiguous legacy state instead of risking cross-project delivery.
+Add keys of your own, normalized the same way, with `payloadPolicy(LogisterPayloadPolicy.builder().addSensitiveKey("customer_email").build())`. `sensitiveKeys(...)` replaces the exact-match list; the contains rule always applies.
+
+Payloads are also bounded in depth, items, string length, and bytes. Envelope and event fields never count against the item budget, the `context` has its own key budget, and each context entry has its own nested budget, so a large context can no longer push out the event's UUID or evidence. When anything is cut, the event carries `context._truncated: true`; an oversized envelope is reduced step by step and, as a last resort, keeps only its required fields. Exception cause chains omit trailing frames shared with the enclosing exception (recorded as `frames_in_common`) and are capped at 150 frames in total. A synchronous `beforeSend(...)` hook may further redact or discard an envelope, but it should never perform network or disk I/O and cannot replace the SDK-owned UUID, occurrence time, or evidence provenance.
+
+Capture never throws into the calling thread. Asynchronous capture builds and sanitizes the envelope on the client executor; if the envelope cannot be built, or the executor has shut down, the returned response is dropped (`isDropped == true`) and counted in `discardedEventCount()`.
+
+Since 0.7.0, both automatic crash capture and manual `captureException` default to `TYPE_AND_STACKTRACE`: the exception type and bounded stack frames, without throwable messages or cause chains. Automatic capture records the bounded actual crashing-thread name with the `crashed` role, persists the envelope before Android's previous uncaught-exception handler runs, and requires the durable offline queue. To include messages and causes in manual captures, opt in with `exceptionDataPolicy(LogisterExceptionDataPolicy.FULL)` only when they are known not to carry personal data or secrets.
+
+The endpoint must use `https`. Plain `http` is accepted only for `localhost`, loopback addresses, and the Android emulator host `10.0.2.2`, or when you call `allowInsecureHttp(true)` in a debug build; otherwise `build()` throws `IllegalArgumentException`. The default transport does not follow redirects, so the bearer token is never resent to another host, and reads at most 64 KiB of a response body.
+
+The offline queue stores at most the configured event and byte limits in an atomic app-private file under `noBackupFilesDir` and expires old entries after `maxAgeDays`. It is scoped by endpoint, application/service, optional `storageNamespace`, and process policy; tokens are never stored. Token-provider failures and retryable `408`, `425`, `429`, and `5xx` responses are queued with bounded, jittered exponential backoff and `Retry-After`; a permanent client rejection is discarded so it cannot block later events. A queued response has `isQueued == true` and `isAccepted == false`; it only becomes accepted after a later server response succeeds. Call `flushQueuedEventsAsync()` after authentication when the app may not immediately emit another event. Call `clearSessionBoundQueuedEvents()` on logout or account replacement; it removes events containing either `session_id` or `user_id` while retaining anonymous automatic crashes. `clearQueuedEvents()` removes everything. Delivery never holds the queue's storage lock, so an uncaught-exception crash is persisted without waiting for a slow in-flight request, and its follow-up delivery runs on a dedicated background thread. Because the 0.3 queue and installation pseudonym had no provable client owner, 0.4 discards that ambiguous legacy state instead of risking cross-project delivery; since 0.7.0 that cleanup runs on the client executor rather than in `build()`.
 
 Android 11+ historical exit capture records the reason, importance, status, process, exact timestamp, stable source identity, stable mechanism, and available last-sampled PSS/RSS values. For ANRs, 0.5 can add a bounded structured Java/Kotlin thread dump from `ApplicationExitInfo.traceInputStream`; it retains only thread names and parsed stack-frame fields and never stores the raw trace, command line, lock annotations, or arbitrary lines. PSS/RSS are labeled as system samples, not exact memory at termination. A bounded no-backup run journal attributes the prior package/version/build/environment/release when the SDK can prove it; otherwise the build is explicitly unknown and never copied from the relaunch. Current session, screen, foreground, device, installation, and breadcrumbs are never attached to a prior-process exit. Raw `ApplicationExitInfo.description` text is never included. When automatic crash capture is enabled, ordinary Java crash exits are not reported again through historical exit capture.
 
@@ -289,10 +302,10 @@ curl -fsSI https://repo1.maven.org/maven2/org/logister/logister-android/X.Y.Z/lo
 gh release view vX.Y.Z
 ```
 
-For `0.6.1`, commit the SDK changes with `VERSION_NAME=0.6.1`, its `CHANGELOG.md` section, and the matching README dependency example, then push or merge that commit to `main`. No manual tag is needed. Follow the `CI`, `Release from main`, and `Release` workflows in that order. If automation is interrupted before Maven Central accepts the version, re-run `Release` from the existing tag; never move a tag after publication:
+For `0.7.0`, commit the SDK changes with `VERSION_NAME=0.7.0`, its `CHANGELOG.md` section, and the matching README dependency example, then push or merge that commit to `main`. No manual tag is needed. Follow the `CI`, `Release from main`, and `Release` workflows in that order. If automation is interrupted before Maven Central accepts the version, re-run `Release` from the existing tag; never move a tag after publication:
 
 ```bash
-gh workflow run release.yml --repo taimoorq/logister-android --ref main -f tag=v0.6.1
+gh workflow run release.yml --repo taimoorq/logister-android --ref main -f tag=v0.7.0
 ```
 
 ## Security and contributing
@@ -348,7 +361,7 @@ consume the response inside `execute`, and handle redirects explicitly.
 For OkHttp, add the optional artifact and install its interceptors last:
 
 ```kotlin
-implementation("org.logister:logister-android-okhttp:0.6.1")
+implementation("org.logister:logister-android-okhttp:0.7.0")
 ```
 
 ```kotlin
