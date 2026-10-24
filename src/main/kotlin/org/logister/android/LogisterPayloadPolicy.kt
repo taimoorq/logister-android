@@ -23,6 +23,7 @@ public class LogisterPayloadPolicy private constructor(builder: Builder) {
     internal val maxCollectionItems: Int = builder.maxCollectionItems
     internal val maxStringCharacters: Int = builder.maxStringCharacters
     internal val maxEnvelopeBytes: Int = builder.maxEnvelopeBytes
+    internal val maxEventKeys: Int = builder.maxEventKeys
     internal val sensitiveKeys: Set<String> = builder.sensitiveKeys.map(::normalizeKey).filter(String::isNotEmpty).toSet()
 
     internal fun isSensitiveKey(key: String): Boolean {
@@ -36,6 +37,7 @@ public class LogisterPayloadPolicy private constructor(builder: Builder) {
         internal var maxCollectionItems: Int = 1_000
         internal var maxStringCharacters: Int = 4_096
         internal var maxEnvelopeBytes: Int = 256 * 1_024
+        internal var maxEventKeys: Int = LogisterServerLimits.MAX_KEYS
         internal val sensitiveKeys: MutableSet<String> = DEFAULT_SENSITIVE_KEYS.toMutableSet()
 
         public fun limits(
@@ -52,6 +54,17 @@ public class LogisterPayloadPolicy private constructor(builder: Builder) {
             this.maxCollectionItems = maxCollectionItems
             this.maxStringCharacters = maxStringCharacters
             this.maxEnvelopeBytes = maxEnvelopeBytes
+        }
+
+        /**
+         * Lowers the total number of object keys kept across one event, counted like the Logister
+         * ingest API counts them (every key at every level). The server rejects events over 512.
+         */
+        public fun maxEventKeys(maxEventKeys: Int): Builder = apply {
+            require(maxEventKeys in 64..LogisterServerLimits.MAX_KEYS) {
+                "maxEventKeys must be between 64 and ${LogisterServerLimits.MAX_KEYS}"
+            }
+            this.maxEventKeys = maxEventKeys
         }
 
         /**
@@ -83,8 +96,9 @@ public class LogisterPayloadPolicy private constructor(builder: Builder) {
 /**
  * Sanitizes an envelope without ever dropping its identity fields. Envelope and event keys are
  * exempt from the item budget; every value below them (including the whole `context`) has its own
- * budget, and each top-level context entry has its own nested budget. When an envelope is still too
- * large, the item and string limits are halved, and finally only the required fields are kept.
+ * budget, and each top-level context entry has its own nested budget. The event is then fitted to
+ * the ingest API's per-event key and byte limits by [LogisterServerLimits]. When an envelope is still
+ * too large, the item and string limits are halved, and finally only the required fields are kept.
  * Any truncation is recorded as `context._truncated`.
  */
 internal fun sanitizeEnvelope(
@@ -121,8 +135,15 @@ private fun sanitizeWithLimits(
 ): JSONObject {
     val state = SanitizeState(policy, limits)
     val output = sanitizeEnvelopeFields(envelope, state)
+    fitEventToServerLimits(output, policy) { state.truncated = true }
     if (state.truncated) markTruncated(output)
     return output
+}
+
+private fun fitEventToServerLimits(envelope: JSONObject, policy: LogisterPayloadPolicy, onTruncated: () -> Unit) {
+    val event = envelope.optJSONObject("event") ?: return
+    val limits = LogisterServerLimits(policy.maxEventKeys, LogisterServerLimits.MAX_BYTES, onTruncated)
+    envelope.put("event", limits.fitEvent(event))
 }
 
 /** Copies envelope or event fields; these never consume an item budget. */
@@ -320,8 +341,10 @@ private fun minimalEnvelope(envelope: JSONObject, policy: LogisterPayloadPolicy)
             sanitizeValue(value, state, ItemBudget(MIN_DEGRADED_ITEMS), depth = 2)?.let { context.put(key, it) }
         }
     }
-    minimal.put("context", context.put(TRUNCATED_KEY, true))
-    return JSONObject().put("event", minimal)
+    val output = JSONObject().put("event", minimal.put("context", context))
+    fitEventToServerLimits(output, policy) {}
+    markTruncated(output)
+    return output
 }
 
 private fun markTruncated(envelope: JSONObject) {

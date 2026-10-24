@@ -114,7 +114,63 @@ class LogisterPayloadPolicyTest {
         val sanitizedContext = sanitized.getJSONObject("context")
         assertTrue(sanitizedContext.getBoolean("_truncated"))
         assertEquals("android", sanitizedContext.getString("platform"))
-        assertTrue(sanitizedContext.length() <= LogisterPayloadPolicy.DEFAULT.maxCollectionItems + 1)
+        ServerPayloadLimits.assertAccepted(sanitized)
+    }
+
+    @Test
+    fun serverKeyLimitKeepsTopFramesThenNewestBreadcrumbsThenCausesThenCallerContext() {
+        fun frames(prefix: String, count: Int) = JSONArray().also { array ->
+            repeat(count) {
+                array.put(JSONObject().put("class", "$prefix$it").put("method", "m").put("file", "F.kt").put("line", it))
+            }
+        }
+        val breadcrumbs = JSONArray()
+        repeat(100) { breadcrumbs.put(JSONObject().put("message", "crumb $it").put("category", "ui")) }
+        val context = JSONObject()
+            .put(
+                "exception",
+                JSONObject().put("type", "Top").put("stacktrace", frames("top", 100))
+                    .put("cause", JSONObject().put("type", "Cause").put("stacktrace", frames("cause", 50))),
+            )
+            .put("breadcrumbs", breadcrumbs)
+            .put("caller_scalar", "kept last")
+        repeat(300) { context.put("caller_$it", JSONObject().put("value", it)) }
+
+        val event = requireNotNull(
+            sanitizeEnvelope(JSONObject().put("event", eventWith(context)), LogisterPayloadPolicy.DEFAULT),
+        ).getJSONObject("event")
+
+        ServerPayloadLimits.assertAccepted(event)
+        val sanitized = event.getJSONObject("context")
+        val exception = sanitized.getJSONObject("exception")
+        assertEquals(100, exception.getJSONArray("stacktrace").length())
+        val kept = sanitized.getJSONArray("breadcrumbs")
+        assertTrue(kept.length() in 1 until 100)
+        assertEquals("crumb 99", kept.getJSONObject(kept.length() - 1).getString("message"))
+        assertFalse(exception.has("cause"))
+        assertFalse(sanitized.has("caller_0"))
+        assertTrue(sanitized.getBoolean("_truncated"))
+    }
+
+    @Test
+    fun maxEventKeysCanLowerTheServerKeyCap() {
+        val policy = LogisterPayloadPolicy.builder().maxEventKeys(64).build()
+        val context = JSONObject()
+        repeat(200) { context.put("key_$it", it) }
+
+        val event = requireNotNull(sanitizeEnvelope(JSONObject().put("event", eventWith(context)), policy))
+            .getJSONObject("event")
+
+        var keys = 0
+        fun count(value: Any?) {
+            when (value) {
+                is JSONObject -> { keys += value.length(); value.keys().forEach { count(value.opt(it)) } }
+                is JSONArray -> for (index in 0 until value.length()) count(value.opt(index))
+            }
+        }
+        count(event)
+        assertTrue("event has $keys keys", keys <= 64)
+        assertEquals("00000000-0000-4000-8000-000000000000", event.getString("uuid"))
     }
 
     @Test

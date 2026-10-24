@@ -35,20 +35,47 @@ class LogisterCaptureSafetyTest {
 
         assertTrue(response.body, response.isAccepted)
         val event = transport.envelopes.single().getJSONObject("event")
+        ServerPayloadLimits.assertAccepted(event)
         assertTrue(event.getString("uuid").isNotBlank())
         assertEquals("error", event.getString("event_type"))
         assertTrue(event.getString("message").startsWith("java.lang.IllegalStateException"))
         assertEquals("reported_stack", event.getJSONObject("evidence").getString("evidence_kind"))
         val context = event.getJSONObject("context")
         assertTrue(context.getBoolean("_truncated"))
-        assertEquals(100, context.getJSONArray("breadcrumbs").length())
-        var exception = context.getJSONObject("exception")
-        var causes = 0
-        while (exception.has("cause")) {
-            exception = exception.getJSONObject("cause")
-            causes += 1
+        assertEquals("android", context.getString("platform"))
+        assertEquals("manual", context.getJSONObject("error").getString("capture_source"))
+        // The top exception keeps every frame; breadcrumbs, causes, and caller context share the rest.
+        val exception = context.getJSONObject("exception")
+        val frames = exception.getJSONArray("stacktrace")
+        assertEquals(100, frames.length())
+        assertEquals("com.acme.checkout.Level4", frames.getJSONObject(0).getString("class"))
+        val breadcrumbs = context.optJSONArray("breadcrumbs")
+        if (breadcrumbs != null && breadcrumbs.length() > 0) {
+            assertEquals("Opened screen 99", breadcrumbs.getJSONObject(breadcrumbs.length() - 1).getString("message"))
         }
-        assertEquals(5, causes)
+    }
+
+    @Test
+    fun automaticCrashWithLargeContextIsPersistedWithinServerLimits() {
+        val store = InMemoryEnvelopeStore()
+        val client = client(RecordingSafetyTransport()) {
+            breadcrumbs(100).defaultContext((0 until 1_200).associate { "custom_%04d".format(it) to "value-$it" })
+        }
+        client.attachOfflineQueue(
+            LogisterOfflineQueue(store = store, maxEvents = 10, maxBytes = 1024 * 1024, maxAgeDays = 7),
+        )
+        repeat(100) { client.addBreadcrumb(LogisterBreadcrumb.builder("Tapped $it").category("ui").build()) }
+
+        client.captureUncaughtException(Thread("main"), causeChain(depth = 6))
+
+        val event = JSONObject(JSONArray(store.value).getJSONObject(0).getString("envelope")).getJSONObject("event")
+        ServerPayloadLimits.assertAccepted(event)
+        val context = event.getJSONObject("context")
+        assertEquals(100, context.getJSONObject("exception").getJSONArray("stacktrace").length())
+        assertEquals("crashed_stack", event.getJSONObject("evidence").getString("evidence_kind"))
+        val breadcrumbs = context.getJSONArray("breadcrumbs")
+        assertEquals("Tapped 99", breadcrumbs.getJSONObject(breadcrumbs.length() - 1).getString("message"))
+        assertTrue(context.getBoolean("_truncated"))
     }
 
     @Test
